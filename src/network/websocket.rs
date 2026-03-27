@@ -143,6 +143,11 @@ async fn accept_ws(
     let real_ip = extracted_ip.lock().unwrap().unwrap_or(peer.ip());
     debug!("WS client resolved IP={}", real_ip);
 
+    if !state.check_conn_rate(real_ip).await {
+        debug!("WS connection rate limit exceeded for {}", real_ip);
+        return Ok(());
+    }
+
     let transport = AoTransport::Ws(WsTransport { ws, buf: String::new() });
     handle_connection(transport, real_ip, state, shutdown).await;
     Ok(())

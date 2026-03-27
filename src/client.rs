@@ -1,5 +1,7 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+use crate::ratelimit::TokenBucket;
 
 /// Mute state for a client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -79,12 +81,26 @@ pub struct ClientSession {
     // Narrator mode
     pub narrator: bool,
 
+    // Rate limiters (per-client token buckets)
+    pub rl_ic: TokenBucket,
+    pub rl_mc: TokenBucket,
+    pub rl_ct: TokenBucket,
+    pub rl_evi: TokenBucket,
+    /// Cooldown for ZZ (mod call): stores the time of the last call.
+    pub last_zz: Option<Instant>,
+    /// Duration between allowed mod calls (from config).
+    pub zz_cooldown: Duration,
+
     // Outbound message sender
     pub tx: mpsc::UnboundedSender<String>,
 }
 
 impl ClientSession {
-    pub fn new(ipid: String, tx: mpsc::UnboundedSender<String>) -> Self {
+    pub fn new(
+        ipid: String,
+        tx: mpsc::UnboundedSender<String>,
+        rl: &crate::config::RateLimitsConfig,
+    ) -> Self {
         Self {
             uid: None,
             hdid: None,
@@ -106,6 +122,12 @@ impl ClientSession {
             warn_count: 0,
             case_prefs: [false; 5],
             narrator: false,
+            rl_ic: TokenBucket::new(rl.ic_rate, rl.ic_burst),
+            rl_mc: TokenBucket::new(rl.mc_rate, rl.mc_burst),
+            rl_ct: TokenBucket::new(rl.ct_rate, rl.ct_burst),
+            rl_evi: TokenBucket::new(rl.evidence_rate, rl.evidence_burst),
+            last_zz: None,
+            zz_cooldown: Duration::from_secs(rl.zz_cooldown_secs),
             tx,
         }
     }

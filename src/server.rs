@@ -1,5 +1,6 @@
 use std::collections::BinaryHeap;
 use std::cmp::Reverse;
+use std::net::IpAddr;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -14,6 +15,7 @@ use crate::{
     game::areas::Area,
     moderation::BanManager,
     privacy::PrivacyLayer,
+    ratelimit::TokenBucket,
     storage::EncryptedDb,
 };
 
@@ -80,6 +82,10 @@ pub struct ServerState {
 
     /// Notifies the master server task whenever the player count changes.
     pub player_watch_tx: watch::Sender<usize>,
+
+    /// Per-IP connection rate limiters. Keyed on raw source IP (before IPID hashing).
+    /// Checked in the TCP and WebSocket listeners before a session is created.
+    pub conn_limiters: Mutex<HashMap<IpAddr, TokenBucket>>,
 }
 
 impl ServerState {
@@ -119,7 +125,25 @@ impl ServerState {
             bans,
             sm_packet,
             player_watch_tx,
+            conn_limiters: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Check whether a new connection from `ip` is within the configured rate limit.
+    /// Returns `true` if the connection is allowed, `false` if it should be dropped.
+    /// Idle entries whose bucket is full are pruned on each call to keep the map small.
+    pub async fn check_conn_rate(&self, ip: IpAddr) -> bool {
+        if self.config.rate_limits.conn_burst == 0 {
+            return true; // burst=0 means disabled
+        }
+        let rl = &self.config.rate_limits;
+        let mut limiters = self.conn_limiters.lock().await;
+        // Prune full (idle) buckets to prevent unbounded growth.
+        limiters.retain(|_, bucket| !bucket.is_full());
+        let bucket = limiters
+            .entry(ip)
+            .or_insert_with(|| TokenBucket::new(rl.conn_rate, rl.conn_burst));
+        bucket.try_consume()
     }
 
     pub fn player_count(&self) -> usize {

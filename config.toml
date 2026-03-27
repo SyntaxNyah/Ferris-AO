@@ -33,3 +33,31 @@ advertise = false
 addr = "https://servers.aceattorneyonline.com/servers"
 # Optional: hostname or IP to advertise. Leave unset to let the master server detect it.
 # hostname = "your.domain.example"
+
+[rate_limits]
+# All per-client limits use a token bucket (rate = sustained tokens/sec, burst = max burst).
+# Packets that exceed the limit are silently dropped.
+
+# IC messages (MS packets)
+ic_rate  = 3.0   # tokens per second
+ic_burst = 5     # burst ceiling
+
+# Music changes (MC packets)
+mc_rate  = 1.0
+mc_burst = 3
+
+# OOC messages (CT packets, including commands)
+ct_rate  = 2.0
+ct_burst = 5
+
+# Evidence operations (PE / DE / EE packets, shared bucket)
+evidence_rate  = 5.0
+evidence_burst = 10
+
+# Mod call cooldown: seconds a client must wait between ZZ packets. 0 = no limit.
+zz_cooldown_secs = 60
+
+# New connections per source IP (applies to both TCP and WebSocket listeners).
+# conn_rate is tokens per second; 0.0833 ≈ 5 connections per minute.
+conn_rate  = 0.0833
+conn_burst = 3

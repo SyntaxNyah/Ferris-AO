@@ -318,6 +318,9 @@ async fn handle_cc(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
 /// MS#desk_mod#pre_anim#char_name#anim#msg#side#sfx_name#emote_mod#char_id#sfx_delay#
 ///    objection_mod#evidence#flip#realization#text_color#showname#other_charid#self_offset#immediate#...%
 async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &Packet) {
+    if !session.rl_ic.try_consume() {
+        return;
+    }
     if !session.can_speak_ic() {
         session.server_message(&state.config.server.name, "You are not allowed to speak in this area.");
         return;
@@ -664,6 +667,9 @@ async fn handle_mc(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
 
     if state.music.contains(&pkt.body[0].to_string()) {
         // Music change
+        if !session.rl_mc.try_consume() {
+            return;
+        }
         if !session.can_change_music() {
             session.server_message(&state.config.server.name, "You are not allowed to change the music here.");
             return;
@@ -742,6 +748,9 @@ async fn handle_rt(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
 
 /// CT#username#message%
 async fn handle_ct(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &Packet) {
+    if !session.rl_ct.try_consume() {
+        return;
+    }
     let username = ao_decode(pkt.body[0].trim());
     if username.is_empty()
         || username == state.config.server.name
@@ -793,6 +802,9 @@ async fn handle_ct(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
 
 /// PE#name#description#image%
 async fn handle_pe(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &Packet) {
+    if !session.rl_evi.try_consume() {
+        return;
+    }
     if !can_alter_evidence(session, state).await {
         session.server_message(&state.config.server.name, "You are not allowed to alter evidence here.");
         return;
@@ -809,6 +821,9 @@ async fn handle_pe(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
 
 /// DE#index%
 async fn handle_de(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &Packet) {
+    if !session.rl_evi.try_consume() {
+        return;
+    }
     if !can_alter_evidence(session, state).await {
         session.server_message(&state.config.server.name, "You are not allowed to alter evidence here.");
         return;
@@ -826,6 +841,9 @@ async fn handle_de(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
 
 /// EE#index#name#description#image%
 async fn handle_ee(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &Packet) {
+    if !session.rl_evi.try_consume() {
+        return;
+    }
     if !can_alter_evidence(session, state).await {
         session.server_message(&state.config.server.name, "You are not allowed to alter evidence here.");
         return;
@@ -844,6 +862,19 @@ async fn handle_ee(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
 
 /// ZZ#reason%
 async fn handle_zz(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &Packet) {
+    if !session.zz_cooldown.is_zero() {
+        if let Some(last) = session.last_zz {
+            if last.elapsed() < session.zz_cooldown {
+                let remaining = session.zz_cooldown.saturating_sub(last.elapsed());
+                session.server_message(
+                    &state.config.server.name,
+                    &format!("Please wait {} more second(s) before calling a mod again.", remaining.as_secs() + 1),
+                );
+                return;
+            }
+        }
+    }
+    session.last_zz = Some(std::time::Instant::now());
     let reason = pkt.body.get(0).map(|s| s.as_str()).unwrap_or("");
     let char_name = session.char_id
         .and_then(|id| state.characters.get(id))
@@ -949,7 +980,7 @@ pub async fn run_client(
     drop(real_ip); // never referenced again
 
     // Create per-client session (lives on this task only).
-    let mut session = ClientSession::new(ipid, tx);
+    let mut session = ClientSession::new(ipid, tx, &state.config.rate_limits);
 
     // Send handshake greeting.
     if let Err(e) = transport.send("decryptor#NOENCRYPT#%").await {

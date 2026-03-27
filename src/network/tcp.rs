@@ -152,6 +152,11 @@ async fn accept_tcp(
 
     debug!("TCP client resolved IP={}", real_ip);
 
+    if !state.check_conn_rate(real_ip).await {
+        debug!("TCP connection rate limit exceeded for {}", real_ip);
+        return Ok(());
+    }
+
     let transport = AoTransport::Tcp(TcpTransport::new(reader, write_half, prefix));
     handle_connection(transport, real_ip, state, shutdown).await;
     Ok(())

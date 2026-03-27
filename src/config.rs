@@ -10,6 +10,8 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub master_server: MasterServerConfig,
+    #[serde(default)]
+    pub rate_limits: RateLimitsConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,6 +78,83 @@ impl Default for MasterServerConfig {
             advertise: false,
             addr: default_ms_addr(),
             hostname: None,
+        }
+    }
+}
+
+/// Per-packet and per-connection rate limit configuration.
+/// All limits use a token bucket algorithm (rate + burst).
+/// Defaults are applied when the `[rate_limits]` section is absent from config.toml.
+#[derive(Debug, Deserialize)]
+pub struct RateLimitsConfig {
+    /// IC message (MS) tokens per second.
+    #[serde(default = "default_ic_rate")]
+    pub ic_rate: f64,
+    /// IC message burst ceiling (max tokens).
+    #[serde(default = "default_ic_burst")]
+    pub ic_burst: u32,
+
+    /// Music change (MC) tokens per second.
+    #[serde(default = "default_mc_rate")]
+    pub mc_rate: f64,
+    /// Music change burst ceiling.
+    #[serde(default = "default_mc_burst")]
+    pub mc_burst: u32,
+
+    /// OOC message (CT) tokens per second.
+    #[serde(default = "default_ct_rate")]
+    pub ct_rate: f64,
+    /// OOC message burst ceiling.
+    #[serde(default = "default_ct_burst")]
+    pub ct_burst: u32,
+
+    /// Evidence operation (PE/DE/EE) tokens per second.
+    #[serde(default = "default_evi_rate")]
+    pub evidence_rate: f64,
+    /// Evidence operation burst ceiling.
+    #[serde(default = "default_evi_burst")]
+    pub evidence_burst: u32,
+
+    /// Seconds a client must wait between mod calls (ZZ). 0 disables the cooldown.
+    #[serde(default = "default_zz_cooldown")]
+    pub zz_cooldown_secs: u64,
+
+    /// New TCP/WS connections allowed per second per source IP.
+    /// e.g. 0.0833 ≈ 5 per minute.
+    #[serde(default = "default_conn_rate")]
+    pub conn_rate: f64,
+    /// Connection burst ceiling per source IP.
+    #[serde(default = "default_conn_burst")]
+    pub conn_burst: u32,
+}
+
+fn default_ic_rate() -> f64 { 3.0 }
+fn default_ic_burst() -> u32 { 5 }
+fn default_mc_rate() -> f64 { 1.0 }
+fn default_mc_burst() -> u32 { 3 }
+fn default_ct_rate() -> f64 { 2.0 }
+fn default_ct_burst() -> u32 { 5 }
+fn default_evi_rate() -> f64 { 5.0 }
+fn default_evi_burst() -> u32 { 10 }
+fn default_zz_cooldown() -> u64 { 60 }
+// 5 connections per minute = 5/60 ≈ 0.0833/s
+fn default_conn_rate() -> f64 { 5.0 / 60.0 }
+fn default_conn_burst() -> u32 { 3 }
+
+impl Default for RateLimitsConfig {
+    fn default() -> Self {
+        Self {
+            ic_rate: default_ic_rate(),
+            ic_burst: default_ic_burst(),
+            mc_rate: default_mc_rate(),
+            mc_burst: default_mc_burst(),
+            ct_rate: default_ct_rate(),
+            ct_burst: default_ct_burst(),
+            evidence_rate: default_evi_rate(),
+            evidence_burst: default_evi_burst(),
+            zz_cooldown_secs: default_zz_cooldown(),
+            conn_rate: default_conn_rate(),
+            conn_burst: default_conn_burst(),
         }
     }
 }
