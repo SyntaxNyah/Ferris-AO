@@ -26,3 +26,10 @@ reverse_proxy_https_port = 443
 [logging]
 log_level = "info"
 log_chat = false
+
+[master_server]
+# Set to true to list your server publicly on the AO master server.
+advertise = false
+addr = "https://servers.aceattorneyonline.com/servers"
+# Optional: hostname or IP to advertise. Leave unset to let the master server detect it.
+# hostname = "your.domain.example"

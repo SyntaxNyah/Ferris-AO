@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod game;
 mod moderation;
+mod ms;
 mod network;
 mod privacy;
 mod protocol;
@@ -17,7 +18,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -116,6 +117,7 @@ async fn main() -> Result<()> {
         .collect();
 
     // ── Build shared server state ──────────────────────────────────────────────
+    let (player_watch_tx, player_watch_rx) = watch::channel(0usize);
     let state = Arc::new(ServerState::new(
         config,
         characters,
@@ -125,6 +127,7 @@ async fn main() -> Result<()> {
         privacy,
         Arc::clone(&db),
         sm_packet,
+        player_watch_tx,
     ));
 
     // ── Shutdown broadcast channel ─────────────────────────────────────────────
@@ -161,6 +164,14 @@ async fn main() -> Result<()> {
             error!("WebSocket listener error: {}", e);
         }
     });
+
+    // ── Spawn master server advertisement task ─────────────────────────────────
+    {
+        let ms_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            ms::advertise(ms_state, player_watch_rx).await;
+        });
+    }
 
     // ── Spawn stdin CLI task ───────────────────────────────────────────────────
     let cli_state = Arc::clone(&state);

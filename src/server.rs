@@ -4,7 +4,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use std::collections::HashMap;
 
 use crate::{
@@ -70,6 +70,9 @@ pub struct ServerState {
 
     /// Pre-built SM packet string (built once at startup).
     pub sm_packet: String,
+
+    /// Notifies the master server task whenever the player count changes.
+    pub player_watch_tx: watch::Sender<usize>,
 }
 
 impl ServerState {
@@ -82,6 +85,7 @@ impl ServerState {
         privacy: PrivacyLayer,
         db: Arc<EncryptedDb>,
         sm_packet: String,
+        player_watch_tx: watch::Sender<usize>,
     ) -> Self {
         let max = config.server.max_players;
         let accounts = AccountManager::new(Arc::clone(&db));
@@ -107,6 +111,7 @@ impl ServerState {
             accounts,
             bans,
             sm_packet,
+            player_watch_tx,
         }
     }
 

@@ -166,6 +166,18 @@ Ferris-AO is configured via `config.toml` in the working directory.
 |---|---|---|---|
 | `server_secret` | string | *(generated)* | Optional: 64-character hex string (32 bytes) used as the HMAC key for hashing. If omitted, a random secret is generated at first startup and stored in the database. **Do not change this after launch** — all existing IPIDs and HDID hashes will be invalidated. |
 
+### `[master_server]`
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `advertise` | boolean | `false` | When `true`, posts server info to the master server so players can discover it |
+| `addr` | string | `"https://servers.aceattorneyonline.com/servers"` | Master server URL |
+| `hostname` | string | *(unset)* | Optional hostname/IP to include in the advertisement. If unset, the master server infers it from the request |
+
+When `reverse_proxy_mode = true`, the server advertises `wss_port` (the `reverse_proxy_https_port` value, e.g. `443`) so the master server lists it as a WSS endpoint. When `reverse_proxy_mode = false`, it advertises `ws_port` (plain WebSocket).
+
+The server posts immediately on startup, every 5 minutes, and whenever the player count changes.
+
 ### `[logging]`
 
 | Key | Type | Default | Description |
@@ -197,6 +209,11 @@ reverse_proxy_mode = false
 [logging]
 log_level = "info"
 log_chat = false
+
+[master_server]
+advertise = true
+addr = "https://servers.aceattorneyonline.com/servers"
+# hostname = "your.domain.example"
 ```
 
 **Example `config.toml` — behind nginx + Cloudflare:**
@@ -207,8 +224,12 @@ tcp_port = 27017
 ws_port = 27018
 bind_addr = "127.0.0.1"        # Only accept connections from nginx
 reverse_proxy_mode = true
-reverse_proxy_http_port = 80   # External ports clients connect to
-reverse_proxy_https_port = 443
+reverse_proxy_http_port = 80
+reverse_proxy_https_port = 443 # Advertised as wss_port to the master server
+
+[master_server]
+advertise = true
+hostname = "your.domain.example"
 ```
 
 ---

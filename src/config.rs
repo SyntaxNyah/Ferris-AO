@@ -8,6 +8,8 @@ pub struct Config {
     pub network: NetworkConfig,
     pub privacy: PrivacyConfig,
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub master_server: MasterServerConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,6 +52,32 @@ pub struct PrivacyConfig {
 pub struct LoggingConfig {
     pub log_level: String,
     pub log_chat: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MasterServerConfig {
+    /// Advertise this server on the master server list.
+    #[serde(default)]
+    pub advertise: bool,
+    /// Master server URL.
+    #[serde(default = "default_ms_addr")]
+    pub addr: String,
+    /// Optional hostname/IP to advertise. If unset, the master server infers it.
+    pub hostname: Option<String>,
+}
+
+fn default_ms_addr() -> String {
+    "https://servers.aceattorneyonline.com/servers".into()
+}
+
+impl Default for MasterServerConfig {
+    fn default() -> Self {
+        Self {
+            advertise: false,
+            addr: default_ms_addr(),
+            hostname: None,
+        }
+    }
 }
 
 impl Config {

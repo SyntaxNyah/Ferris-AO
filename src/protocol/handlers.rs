@@ -222,6 +222,7 @@ async fn handle_rd(session: &mut ClientSession, state: &Arc<ServerState>) {
 
     // Increment player count
     state.player_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _ = state.player_watch_tx.send(state.player_count());
 
     // Join area 0
     {
@@ -923,6 +924,7 @@ pub async fn run_client(
         // Remove from client list.
         state.remove_client(uid).await;
         state.player_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = state.player_watch_tx.send(state.player_count());
         state.free_uid(uid).await;
 
         // Broadcast updated ARUP.
