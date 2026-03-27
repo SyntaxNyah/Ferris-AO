@@ -65,6 +65,8 @@ pub struct ClientSession {
 
     // Pairing
     pub pair_info: PairInfo,
+    /// UID of a confirmed force-pair partner (set by /pair when mutual, cleared by /unpair).
+    pub force_pair_uid: Option<u32>,
 
     // Mute
     pub mute_state: MuteState,
@@ -98,6 +100,7 @@ impl ClientSession {
             showname: String::new(),
             pos: String::new(),
             pair_info: PairInfo { wanted_id: None, ..Default::default() },
+            force_pair_uid: None,
             mute_state: MuteState::None,
             mute_until: None,
             warn_count: 0,

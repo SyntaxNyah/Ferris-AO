@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use crate::{
     auth::AccountManager,
+    client::PairInfo,
     config::Config,
     game::areas::Area,
     moderation::BanManager,
@@ -18,7 +19,8 @@ use crate::{
 
 pub const VERSION: &str = "NyahAO v0.1.0";
 
-/// A handle to a connected client, used by the server to broadcast messages.
+/// A handle to a connected client, stored in ServerState and readable by all tasks.
+#[derive(Clone)]
 pub struct ClientHandle {
     pub uid: u32,
     pub area_idx: usize,
@@ -27,6 +29,11 @@ pub struct ClientHandle {
     pub char_id: Option<usize>,
     pub authenticated: bool,
     pub tx: mpsc::UnboundedSender<String>,
+    // Pairing — updated after each IC message and by /pair//unpair
+    pub pair_wanted_id: Option<usize>,
+    pub force_pair_uid: Option<u32>,
+    pub pair_info: PairInfo,
+    pub pos: String,
 }
 
 impl ClientHandle {

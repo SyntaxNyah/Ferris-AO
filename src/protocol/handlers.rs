@@ -256,6 +256,10 @@ async fn handle_rd(session: &mut ClientSession, state: &Arc<ServerState>) {
         char_id: None,
         authenticated: false,
         tx: session.tx.clone(),
+        pair_wanted_id: None,
+        force_pair_uid: None,
+        pair_info: Default::default(),
+        pos: String::new(),
     });
     state.add_client(handle).await;
 
@@ -502,38 +506,98 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
         }
     }
 
-    // Pairing logic
-    let pair_char_id_str = args[16].split('^').next().unwrap_or("-1");
-    if pair_char_id_str != "-1" {
-        if let Ok(pair_id) = pair_char_id_str.parse::<usize>() {
-            if pair_id < state.characters.len() && session.char_id != Some(pair_id) {
-                session.pair_info.wanted_id = Some(pair_id);
-                let char_id = session.char_id.unwrap_or(usize::MAX);
-                let my_pos = session.pos.clone();
-                // Look for a matching pairing partner
-                let mut found_pair: Option<(String, String, String, String)> = None;
-                {
-                    let clients = state.clients.lock().await;
-                    for handle in clients.values() {
-                        // We can't read their session directly (different tasks).
-                        // The pair info is stored in the pair_info field of each session,
-                        // but sessions live in separate tasks. We approximate by checking
-                        // if there's a client with the right char_id in the same area.
-                        // Full pairing requires a shared structure; for now, skip pairing.
-                        // TODO: implement cross-task pair info via a shared map.
+    // ── Pairing ──────────────────────────────────────────────────────────────────
+    let my_uid = session.uid.unwrap_or(u32::MAX);
+    let my_char_id = session.char_id.unwrap_or(usize::MAX);
+    {
+        let mut clients = state.clients.lock().await;
+
+        // Phase 1: Force-pair sync — override args[16] to partner's current char_id.
+        if let Some(force_uid) = session.force_pair_uid {
+            let partner_info = clients.get(&force_uid).map(|h| (h.char_id, h.pos.clone()));
+            match partner_info {
+                Some((Some(pid), ppos)) => {
+                    args[16] = pid.to_string();
+                    session.pair_info.wanted_id = Some(pid);
+                    // Keep partner's wanted_id pointed at our current char.
+                    if let Some(ph) = clients.get_mut(&force_uid) {
+                        Arc::make_mut(ph).pair_wanted_id = session.char_id;
+                    }
+                    // Sync our position to partner's.
+                    if !ppos.is_empty() {
+                        args[5] = ppos;
                     }
                 }
-                if found_pair.is_none() {
-                    args[16] = "-1^".into();
-                } else if let Some((pname, pemote, poffset, pflip)) = found_pair {
-                    args[17] = pname;
-                    args[18] = pemote;
-                    args[20] = poffset;
-                    args[21] = pflip;
+                _ => {
+                    // Partner gone or has no character — drop the force-pair bond.
+                    session.force_pair_uid = None;
+                    args[16] = "-1".to_string();
                 }
-            } else {
-                args[16] = "-1^".into();
             }
+        }
+
+        // Phase 2: If client didn't send a pair target but server has a wanted_id, inject it.
+        {
+            let cur = args[16].split('^').next().unwrap_or("").trim();
+            if cur.is_empty() || cur == "-1" {
+                if let Some(wanted) = session.pair_info.wanted_id {
+                    args[16] = wanted.to_string();
+                }
+            }
+        }
+
+        // Phase 3: Find a matching pair partner in the area.
+        let pair_str = args[16].split('^').next().unwrap_or("").trim().to_string();
+        let mut found: Option<(String, String, String, String)> = None;
+
+        if !pair_str.is_empty() && pair_str != "-1" {
+            if let Ok(pair_id) = pair_str.parse::<usize>() {
+                if pair_id < state.characters.len() && session.char_id != Some(pair_id) {
+                    session.pair_info.wanted_id = Some(pair_id);
+                    let force_uid = session.force_pair_uid;
+                    let my_pos = args[5].clone(); // Use position after possible force-sync
+
+                    for handle in clients.values() {
+                        if handle.uid == my_uid || handle.area_idx != session.area_idx {
+                            continue;
+                        }
+                        let is_force = force_uid
+                            .map(|f| f == handle.uid && handle.force_pair_uid == Some(my_uid))
+                            .unwrap_or(false);
+                        // With a force-pair bond, only match that specific partner.
+                        if force_uid.is_some() && !is_force {
+                            continue;
+                        }
+                        // Skip candidates force-bonded to someone else.
+                        if handle.force_pair_uid.is_some() && handle.force_pair_uid != Some(my_uid) {
+                            continue;
+                        }
+                        if handle.char_id == Some(pair_id)
+                            && handle.pair_wanted_id == Some(my_char_id)
+                            && (is_force || handle.pos == my_pos)
+                        {
+                            found = Some((
+                                handle.pair_info.char_name.clone(),
+                                handle.pair_info.emote.clone(),
+                                handle.pair_info.offset.clone(),
+                                handle.pair_info.flip.clone(),
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((pname, pemote, poffset, pflip)) = found {
+            args[17] = pname;
+            args[18] = pemote;
+            args[20] = poffset;
+            args[21] = pflip;
+        } else {
+            args[16] = "-1^".to_string();
+            args[17].clear();
+            args[18].clear();
         }
     }
 
@@ -556,6 +620,18 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
         args[15].clone()
     };
     session.pos = args[5].clone();
+
+    // Sync updated pair state and position to the shared ClientHandle.
+    {
+        let mut clients = state.clients.lock().await;
+        if let Some(h) = clients.get_mut(&my_uid) {
+            let h = Arc::make_mut(h);
+            h.pair_wanted_id = session.pair_info.wanted_id;
+            h.force_pair_uid = session.force_pair_uid;
+            h.pair_info = session.pair_info.clone();
+            h.pos = session.pos.clone();
+        }
+    }
 
     // Update last_speaker in area
     {

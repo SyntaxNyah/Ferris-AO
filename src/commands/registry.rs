@@ -1,10 +1,10 @@
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 use crate::{
     auth::accounts::perms,
     client::ClientSession,
     game::areas::{LockState, Status},
+    protocol::packet::ao_encode,
     server::ServerState,
 };
 
@@ -44,6 +44,8 @@ pub async fn dispatch_command(
         "baninfo" => cmd_baninfo(session, state, args).await,
         "announce" => cmd_announce(session, state, args).await,
         "modchat" => cmd_modchat(session, state, args).await,
+        "pair" => cmd_pair(session, state, args).await,
+        "unpair" => cmd_unpair(session, state).await,
         "motd" => cmd_motd(session, state),
         "clear" => cmd_clear(session, state).await,
         _ => {
@@ -57,7 +59,7 @@ fn cmd_help(session: &mut ClientSession, state: &Arc<ServerState>) {
 Commands:
 /help /about /who /move <area> /charselect /doc [text] /areainfo
 /cm [uid] /uncm [uid] /bg <bg> /status <status> /lock [-s] /unlock /play <song>
-/narrator /login <user> <pass> /logout /mod <msg>
+/pair <uid> /unpair /narrator /login <user> <pass> /logout /mod <msg>
 [MOD] /kick <uid> /mute <uid> [ic|ooc|all] /unmute <uid> /warn <uid> <reason>
 [MOD] /ban <uid> <reason> /unban <ban_id> /baninfo <hdid_hash> /announce <msg> /modchat <msg>
 /motd /clear";
@@ -764,6 +766,162 @@ fn cmd_motd(session: &mut ClientSession, state: &Arc<ServerState>) {
     } else {
         session.server_message(&state.config.server.name, &state.config.server.motd);
     }
+}
+
+async fn cmd_pair(session: &mut ClientSession, state: &Arc<ServerState>, args: Vec<String>) {
+    let sname = state.config.server.name.clone();
+    if session.char_id.is_none() {
+        session.server_message(&sname, "You must have a character selected to pair.");
+        return;
+    }
+    if args.is_empty() {
+        session.server_message(&sname, "Usage: /pair <uid>");
+        return;
+    }
+    let target_uid: u32 = match args[0].parse() {
+        Ok(n) => n,
+        Err(_) => { session.server_message(&sname, "Invalid UID."); return; }
+    };
+    let my_uid = session.uid.unwrap_or(u32::MAX);
+    if target_uid == my_uid {
+        session.server_message(&sname, "You cannot pair with yourself.");
+        return;
+    }
+    let my_char_id = session.char_id.unwrap();
+
+    // Read target info and check validity
+    let (target_char_id, target_char_name, is_mutual, target_tx) = {
+        let clients = state.clients.lock().await;
+        let target = match clients.get(&target_uid) {
+            Some(h) => h,
+            None => { session.server_message(&sname, "Player not found."); return; }
+        };
+        if target.area_idx != session.area_idx {
+            session.server_message(&sname, "That player is not in your area.");
+            return;
+        }
+        let target_char_id = match target.char_id {
+            Some(id) => id,
+            None => { session.server_message(&sname, "That player has no character selected."); return; }
+        };
+        let target_char_name = state.characters.get(target_char_id).cloned().unwrap_or_default();
+        let is_mutual = target.pair_wanted_id == Some(my_char_id);
+        let target_tx = target.tx.clone();
+        (target_char_id, target_char_name, is_mutual, target_tx)
+    };
+
+    // Update session pair state
+    session.pair_info.wanted_id = Some(target_char_id);
+    if is_mutual {
+        session.force_pair_uid = Some(target_uid);
+    }
+
+    // Update our ClientHandle and, if mutual, the partner's too
+    {
+        let mut clients = state.clients.lock().await;
+        if let Some(h) = clients.get_mut(&my_uid) {
+            let h = Arc::make_mut(h);
+            h.pair_wanted_id = Some(target_char_id);
+            h.force_pair_uid = if is_mutual { Some(target_uid) } else { None };
+        }
+        if is_mutual {
+            if let Some(h) = clients.get_mut(&target_uid) {
+                let h = Arc::make_mut(h);
+                h.force_pair_uid = Some(my_uid);
+                h.pair_wanted_id = Some(my_char_id);
+            }
+        }
+    }
+
+    let my_char_name = session.char_id
+        .and_then(|id| state.characters.get(id))
+        .map(|s| s.as_str())
+        .unwrap_or("Unknown");
+
+    if is_mutual {
+        session.server_message(&sname, &format!("You are now paired with {}.", target_char_name));
+        let _ = target_tx.send(format!(
+            "CT#{}#{}#1#%",
+            ao_encode(&sname),
+            ao_encode(&format!("{} is now paired with you.", my_char_name)),
+        ));
+    } else {
+        session.server_message(&sname, &format!(
+            "Pair request sent to {}. They must use /pair {} to confirm.",
+            target_char_name, my_uid
+        ));
+        let _ = target_tx.send(format!(
+            "CT#{}#{}#1#%",
+            ao_encode(&sname),
+            ao_encode(&format!("{} wants to pair with you. Use /pair {} to confirm.", my_char_name, my_uid)),
+        ));
+    }
+}
+
+async fn cmd_unpair(session: &mut ClientSession, state: &Arc<ServerState>) {
+    let sname = state.config.server.name.clone();
+    let my_uid = session.uid.unwrap_or(u32::MAX);
+    let my_char_id = session.char_id.unwrap_or(usize::MAX);
+
+    if session.pair_info.wanted_id.is_none() && session.force_pair_uid.is_none() {
+        session.server_message(&sname, "You are not paired with anyone.");
+        return;
+    }
+
+    let my_char_name = session.char_id
+        .and_then(|id| state.characters.get(id))
+        .map(|s| s.as_str())
+        .unwrap_or("Unknown")
+        .to_string();
+
+    // If force-paired, clear the partner's side and notify them
+    if let Some(force_uid) = session.force_pair_uid {
+        let partner_tx = {
+            let mut clients = state.clients.lock().await;
+            let tx = clients.get(&force_uid).map(|h| h.tx.clone());
+            if let Some(h) = clients.get_mut(&force_uid) {
+                let h = Arc::make_mut(h);
+                h.force_pair_uid = None;
+                h.pair_wanted_id = None;
+            }
+            tx
+        };
+        if let Some(tx) = partner_tx {
+            let _ = tx.send(format!(
+                "CT#{}#{}#1#%",
+                ao_encode(&sname),
+                ao_encode(&format!("{} has ended the pair.", my_char_name)),
+            ));
+        }
+        session.force_pair_uid = None;
+    }
+
+    // Notify anyone with a pending (non-force) pair request on us
+    {
+        let clients = state.clients.lock().await;
+        for handle in clients.values() {
+            if handle.uid != my_uid && handle.pair_wanted_id == Some(my_char_id) {
+                let _ = handle.tx.send(format!(
+                    "CT#{}#{}#1#%",
+                    ao_encode(&sname),
+                    ao_encode("Your pair partner has unpaired."),
+                ));
+            }
+        }
+    }
+
+    // Clear our own pair state
+    session.pair_info.wanted_id = None;
+    {
+        let mut clients = state.clients.lock().await;
+        if let Some(h) = clients.get_mut(&my_uid) {
+            let h = Arc::make_mut(h);
+            h.pair_wanted_id = None;
+            h.force_pair_uid = None;
+        }
+    }
+
+    session.server_message(&sname, "You have unpaired.");
 }
 
 async fn cmd_clear(session: &mut ClientSession, state: &Arc<ServerState>) {
