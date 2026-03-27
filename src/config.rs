@@ -137,9 +137,9 @@ fn default_ct_burst() -> u32 { 5 }
 fn default_evi_rate() -> f64 { 5.0 }
 fn default_evi_burst() -> u32 { 10 }
 fn default_zz_cooldown() -> u64 { 60 }
-// 5 connections per minute = 5/60 ≈ 0.0833/s
-fn default_conn_rate() -> f64 { 5.0 / 60.0 }
-fn default_conn_burst() -> u32 { 3 }
+// 1 connection per second (60/min) — permissive enough for bad WiFi reconnects
+fn default_conn_rate() -> f64 { 1.0 }
+fn default_conn_burst() -> u32 { 5 }
 
 impl Default for RateLimitsConfig {
     fn default() -> Self {

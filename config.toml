@@ -58,6 +58,6 @@ evidence_burst = 10
 zz_cooldown_secs = 60
 
 # New connections per source IP (applies to both TCP and WebSocket listeners).
-# conn_rate is tokens per second; 0.0833 ≈ 5 connections per minute.
-conn_rate  = 0.0833
-conn_burst = 3
+# 1.0 = 1 per second sustained (60/min), burst absorbs quick reconnects from bad WiFi.
+conn_rate  = 1.0
+conn_burst = 5
