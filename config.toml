@@ -1,0 +1,21 @@
+[server]
+name = "NyahAO Server"
+description = "A privacy-first AO2 server."
+motd = "Welcome to NyahAO!"
+max_players = 100
+max_message_len = 256
+asset_url = ""
+multiclient_limit = 8
+
+[network]
+tcp_port = 27017
+ws_port = 27018
+bind_addr = "0.0.0.0"
+
+[privacy]
+# If unset, a server secret is generated at startup and stored in the database.
+# server_secret = ""
+
+[logging]
+log_level = "info"
+log_chat = false

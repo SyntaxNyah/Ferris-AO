@@ -1,0 +1,5 @@
+/target/
+/data/nyahao.db
+/data/nyahao.db-shm
+/data/nyahao.db-wal
+*.env
