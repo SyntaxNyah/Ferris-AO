@@ -155,7 +155,10 @@ Ferris-AO is configured via `config.toml` in the working directory.
 |---|---|---|---|
 | `tcp_port` | integer | `27017` | Port for legacy TCP (AO2) connections |
 | `ws_port` | integer | `27018` | Port for WebSocket connections |
-| `bind_addr` | string | `"0.0.0.0"` | Address to bind both listeners to. Use `"127.0.0.1"` if running behind nginx |
+| `bind_addr` | string | `"0.0.0.0"` | Address to bind both listeners to. Use `"127.0.0.1"` when running behind nginx |
+| `reverse_proxy_mode` | boolean | `false` | When `true`, trust `X-Forwarded-For` and `X-Real-IP` headers for real client IPs, and detect PROXY Protocol v2 on TCP. **Must be `false` for direct (no proxy) deployments** — trusting these headers without a proxy is a security risk. |
+| `reverse_proxy_http_port` | integer | `80` | External HTTP port advertised to the master server when `reverse_proxy_mode = true` |
+| `reverse_proxy_https_port` | integer | `443` | External HTTPS/WSS port advertised to the master server when `reverse_proxy_mode = true` |
 
 ### `[privacy]`
 
@@ -170,7 +173,7 @@ Ferris-AO is configured via `config.toml` in the working directory.
 | `log_level` | string | `"info"` | Tracing log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `log_chat` | boolean | `false` | Whether to log IC message content. Disabled by default for privacy. |
 
-**Example `config.toml`:**
+**Example `config.toml` — direct (no proxy):**
 
 ```toml
 [server]
@@ -186,6 +189,7 @@ multiclient_limit = 8
 tcp_port = 27017
 ws_port = 27018
 bind_addr = "0.0.0.0"
+reverse_proxy_mode = false
 
 [privacy]
 # server_secret = "your_64_char_hex_string_here"
@@ -193,6 +197,18 @@ bind_addr = "0.0.0.0"
 [logging]
 log_level = "info"
 log_chat = false
+```
+
+**Example `config.toml` — behind nginx + Cloudflare:**
+
+```toml
+[network]
+tcp_port = 27017
+ws_port = 27018
+bind_addr = "127.0.0.1"        # Only accept connections from nginx
+reverse_proxy_mode = true
+reverse_proxy_http_port = 80   # External ports clients connect to
+reverse_proxy_https_port = 443
 ```
 
 ---
@@ -360,17 +376,42 @@ While the server is running, the process reads commands from stdin:
 
 ## nginx Setup
 
-It is strongly recommended to run Ferris-AO behind nginx for TLS termination, rate limiting, and DDoS protection via Cloudflare.
+It is strongly recommended to run Ferris-AO behind nginx for TLS termination, rate limiting, and DDoS protection via Cloudflare. Set `reverse_proxy_mode = true` in `config.toml` whenever nginx is in front.
 
-A complete example config is provided at `nginx/nyahao.conf`. Below is a summary.
+A complete example config with all options is provided at `nginx/nyahao.conf`.
 
-### WebSocket (Required for web clients)
+### With Cloudflare (recommended)
+
+Cloudflare handles TLS — nginx sits on port 80 and passes plain HTTP to Ferris-AO. The real client IP arrives in the `X-Forwarded-For` header set by Cloudflare automatically.
 
 ```nginx
-# Rate limiting zones (in http block)
-limit_conn_zone $binary_remote_addr zone=ao_ws:10m;
-limit_req_zone  $binary_remote_addr zone=ao_ws_req:10m rate=10r/s;
+server {
+    listen 80;
+    listen [::]:80;
+    server_name your.domain.example;
 
+    location / {
+        proxy_pass         http://127.0.0.1:27018;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade         $http_upgrade;
+        proxy_set_header   Connection      "upgrade";
+        proxy_set_header   Host            $host;
+        proxy_set_header   X-Forwarded-For $http_x_forwarded_for;
+        proxy_set_header   X-Real-IP       $http_x_forwarded_for;
+        proxy_read_timeout 7200s;
+        proxy_send_timeout 30s;
+        proxy_buffering    off;
+    }
+}
+```
+
+Ferris-AO reads `X-Forwarded-For` first (taking the first address in the list), then falls back to `X-Real-IP`. The raw peer address is never used when `reverse_proxy_mode = true`.
+
+### Without Cloudflare (direct nginx TLS)
+
+If you are managing TLS yourself with a Let's Encrypt certificate:
+
+```nginx
 server {
     listen 443 ssl;
     listen [::]:443 ssl;
@@ -378,45 +419,40 @@ server {
 
     ssl_certificate     /etc/letsencrypt/live/your.domain.example/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/your.domain.example/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
 
     location / {
-        limit_conn ao_ws 8;
-        limit_req  zone=ao_ws_req burst=10 nodelay;
-
-        proxy_pass http://127.0.0.1:27018;
+        proxy_pass         http://127.0.0.1:27018;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade    $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header CF-Connecting-IP $http_cf_connecting_ip;
-        proxy_set_header X-Real-IP        $remote_addr;
-
+        proxy_set_header   Upgrade         $http_upgrade;
+        proxy_set_header   Connection      "upgrade";
+        proxy_set_header   Host            $host;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Real-IP       $remote_addr;
         proxy_read_timeout 7200s;
-        proxy_send_timeout 7200s;
+        proxy_send_timeout 30s;
+        proxy_buffering    off;
     }
 }
 ```
 
 ### TCP (Optional — requires Cloudflare Spectrum)
 
-For legacy TCP support behind nginx, the `stream` module must be compiled in (`--with-stream`):
+For legacy TCP clients behind nginx, the `stream` module must be compiled in (`--with-stream`). With Cloudflare, TCP passthrough requires Cloudflare Spectrum (paid plan).
 
 ```nginx
 stream {
-    limit_conn_zone $binary_remote_addr zone=ao_tcp:10m;
-
     server {
-        listen 27016;
-        limit_conn ao_tcp 5;
-
-        proxy_pass        127.0.0.1:27017;
-        proxy_protocol    on;   # Sends PROXY Protocol v2 to backend
+        listen     27016;
+        proxy_pass 127.0.0.1:27017;
+        proxy_protocol        on;   # Prepends PROXY Protocol v2 header
+        proxy_connect_timeout 10s;
+        proxy_timeout         7200s;
     }
 }
 ```
 
-When `proxy_protocol on` is set, nginx prepends a PP2 header to each connection. Ferris-AO detects the magic bytes and extracts the real client IP before hashing it to an IPID.
-
-> If nginx is not sending PROXY Protocol, set `bind_addr = "0.0.0.0"` and connect clients directly. The server will use the socket peer address as the IP.
+With `proxy_protocol on`, nginx prepends a PP2 header so Ferris-AO can recover the real client IP. This only activates when `reverse_proxy_mode = true` — without it the server uses the peer address directly.
 
 ---
 

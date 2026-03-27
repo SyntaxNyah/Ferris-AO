@@ -1,8 +1,9 @@
 //! WebSocket listener.
 //!
-//! Nginx forwards WebSocket upgrades from port 443 with the real client IP
-//! in the `X-Real-IP` header (or `CF-Connecting-IP` when behind Cloudflare).
-//! We only trust these headers when the peer address is 127.0.0.1.
+//! When `reverse_proxy_mode = true` in config, the real client IP is extracted
+//! from proxy headers in priority order: `X-Forwarded-For` (first address) →
+//! `X-Real-IP`. This matches how Nyathena handles reverse proxy IP extraction.
+//! When `reverse_proxy_mode = false`, the raw TCP peer address is used.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -106,23 +107,27 @@ async fn accept_ws(
     state: Arc<ServerState>,
     shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
-    // Only trust forwarded headers when the TCP peer is localhost (nginx proxy).
-    let peer_is_proxy = match peer.ip() {
-        IpAddr::V4(v4) => v4.is_loopback(),
-        IpAddr::V6(v6) => v6.is_loopback(),
-    };
+    let proxy_mode = state.config.network.reverse_proxy_mode;
 
     // Use Arc<Mutex> so the FnOnce callback can write and we can read after.
     let extracted_ip: Arc<Mutex<Option<IpAddr>>> = Arc::new(Mutex::new(None));
     let extracted_ip_cb = Arc::clone(&extracted_ip);
 
     let ws = accept_hdr_async(stream, move |req: &Request, res: Response| {
-        if peer_is_proxy {
+        if proxy_mode {
             let headers = req.headers();
+            // Priority: X-Forwarded-For (first address) → X-Real-IP
             let raw = headers
-                .get("cf-connecting-ip")
-                .or_else(|| headers.get("x-real-ip"))
+                .get("x-forwarded-for")
                 .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.split(',').next())
+                .map(str::trim)
+                .or_else(|| {
+                    headers
+                        .get("x-real-ip")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::trim)
+                })
                 .unwrap_or("");
 
             if let Ok(ip) = raw.parse::<IpAddr>() {

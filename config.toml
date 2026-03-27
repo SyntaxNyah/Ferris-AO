@@ -11,6 +11,13 @@ multiclient_limit = 8
 tcp_port = 27017
 ws_port = 27018
 bind_addr = "0.0.0.0"
+# Set to true when running behind nginx/Cloudflare.
+# Enables trust of X-Forwarded-For and X-Real-IP headers for real client IPs.
+# Leave false for direct (no proxy) deployments.
+reverse_proxy_mode = false
+# External ports advertised to the master server when reverse_proxy_mode = true.
+reverse_proxy_http_port = 80
+reverse_proxy_https_port = 443
 
 [privacy]
 # If unset, a server secret is generated at startup and stored in the database.

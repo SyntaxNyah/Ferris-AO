@@ -26,7 +26,20 @@ pub struct NetworkConfig {
     pub tcp_port: u16,
     pub ws_port: u16,
     pub bind_addr: String,
+    /// When true, proxy headers (X-Forwarded-For, X-Real-IP) are trusted for
+    /// the real client IP. Must be false unless nginx/Cloudflare is in front.
+    #[serde(default)]
+    pub reverse_proxy_mode: bool,
+    /// External HTTP port advertised when reverse_proxy_mode is true (e.g. 80).
+    #[serde(default = "default_http_port")]
+    pub reverse_proxy_http_port: u16,
+    /// External HTTPS port advertised when reverse_proxy_mode is true (e.g. 443).
+    #[serde(default = "default_https_port")]
+    pub reverse_proxy_https_port: u16,
 }
+
+fn default_http_port() -> u16 { 80 }
+fn default_https_port() -> u16 { 443 }
 
 #[derive(Debug, Deserialize)]
 pub struct PrivacyConfig {

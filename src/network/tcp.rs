@@ -1,8 +1,8 @@
-//! TCP listener with PROXY Protocol v2 detection.
+//! TCP listener with optional PROXY Protocol v2 detection.
 //!
-//! Nginx forwards raw TCP connections from port 27016 to this backend
-//! with `proxy_protocol on`, prepending a PP2 header so we can recover
-//! the original client IP without ever storing the raw address ourselves.
+//! When `reverse_proxy_mode = true`, nginx is expected to prepend a PP2
+//! header (`proxy_protocol on`) so we can recover the real client IP.
+//! When `reverse_proxy_mode = false`, the raw peer address is used directly.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -128,22 +128,26 @@ async fn accept_tcp(
     state: Arc<ServerState>,
     shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
-    // Split into owned read + write halves.
     let (read_half, write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    // Read exactly 12 bytes to detect the PP2 magic prefix.
-    // AO2 packets are always longer than 12 bytes, so this is safe.
-    let mut peek = [0u8; 12];
-    reader.read_exact(&mut peek).await?;
+    let (real_ip, prefix): (IpAddr, Vec<u8>) = if state.config.network.reverse_proxy_mode {
+        // Read exactly 12 bytes to detect the PP2 magic prefix.
+        // AO2 packets are always longer than 12 bytes, so this is safe.
+        let mut peek = [0u8; 12];
+        reader.read_exact(&mut peek).await?;
 
-    let (real_ip, prefix): (IpAddr, Vec<u8>) = if &peek == PP2_MAGIC {
-        // PP2 present: read the full PP2 header and extract source addr.
-        let ip = parse_pp2(&mut reader, &peek).await?;
-        (ip, vec![])
+        if &peek == PP2_MAGIC {
+            // PP2 present: read the full PP2 header and extract source addr.
+            let ip = parse_pp2(&mut reader, &peek).await?;
+            (ip, vec![])
+        } else {
+            // Proxy mode on but no PP2 header — fall back to peer addr.
+            (peer.ip(), peek.to_vec())
+        }
     } else {
-        // No PP2: treat peek bytes as AO2 data; use peer addr as IP.
-        (peer.ip(), peek.to_vec())
+        // Direct connection: use the raw peer address, no peeking needed.
+        (peer.ip(), vec![])
     };
 
     debug!("TCP client resolved IP={}", real_ip);
