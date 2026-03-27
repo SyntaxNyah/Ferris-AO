@@ -23,6 +23,7 @@ pub mod perms {
     pub const MOD_CHAT: u64 = 1 << 9;
     pub const MUTE: u64 = 1 << 10;
     pub const LOG: u64 = 1 << 11;
+    pub const WATCHLIST: u64 = 1 << 12;
     pub const ADMIN: u64 = u64::MAX;
 
     pub fn has(perms: u64, required: u64) -> bool {
@@ -33,7 +34,7 @@ pub mod perms {
         match role.to_uppercase().as_str() {
             "ADMIN" => ADMIN,
             "MOD" | "MODERATOR" => KICK | BAN | BYPASS_LOCK | MOD_EVI | MODIFY_AREA
-                | MOVE_USERS | MOD_SPEAK | BAN_INFO | MOD_CHAT | MUTE | LOG,
+                | MOVE_USERS | MOD_SPEAK | BAN_INFO | MOD_CHAT | MUTE | LOG | WATCHLIST,
             "TRIAL" => KICK | MUTE | LOG,
             "CM" => CM,
             _ => NONE,

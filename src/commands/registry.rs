@@ -48,6 +48,7 @@ pub async fn dispatch_command(
         "unpair" => cmd_unpair(session, state).await,
         "motd" => cmd_motd(session, state),
         "clear" => cmd_clear(session, state).await,
+        "watchlist" => cmd_watchlist(session, state, args).await,
         _ => {
             session.server_message(&state.config.server.name, &format!("Unknown command: /{}", command));
         }
@@ -62,6 +63,7 @@ Commands:
 /pair <uid> /unpair /narrator /login <user> <pass> /logout /mod <msg>
 [MOD] /kick <uid> /mute <uid> [ic|ooc|all] /unmute <uid> /warn <uid> <reason>
 [MOD] /ban <uid> <reason> /unban <ban_id> /baninfo <hdid_hash> /announce <msg> /modchat <msg>
+[MOD] /watchlist add <hdid> [note] | /watchlist remove <hdid> | /watchlist list
 /motd /clear";
     session.server_message(&state.config.server.name, msg);
 }
@@ -940,4 +942,65 @@ async fn cmd_clear(session: &mut ClientSession, state: &Arc<ServerState>) {
         &spacer,
         "1",
     ]).await;
+}
+
+async fn cmd_watchlist(session: &mut ClientSession, state: &Arc<ServerState>, args: Vec<String>) {
+    use crate::auth::accounts::perms;
+    if !perms::has(session.permissions, perms::WATCHLIST) {
+        session.server_message(&state.config.server.name, "No permission.");
+        return;
+    }
+
+    let sname = state.config.server.name.clone();
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("");
+
+    match sub {
+        "add" => {
+            if args.len() < 2 {
+                session.server_message(&sname, "Usage: /watchlist add <hdid_hash> [note]");
+                return;
+            }
+            let hdid = &args[1];
+            let note = args[2..].join(" ");
+            let mod_name = session.mod_name.as_deref().unwrap_or("unknown");
+            match state.watchlist.add(hdid, mod_name, &note) {
+                Ok(()) => session.server_message(&sname, &format!("Added {}... to watchlist.", &hdid[..hdid.len().min(16)])),
+                Err(e) => session.server_message(&sname, &format!("Error: {}", e)),
+            }
+        }
+        "remove" | "rm" => {
+            if args.len() < 2 {
+                session.server_message(&sname, "Usage: /watchlist remove <hdid_hash>");
+                return;
+            }
+            let hdid = &args[1];
+            match state.watchlist.remove(hdid) {
+                Ok(true) => session.server_message(&sname, &format!("Removed {}... from watchlist.", &hdid[..hdid.len().min(16)])),
+                Ok(false) => session.server_message(&sname, "HDID not found on watchlist."),
+                Err(e) => session.server_message(&sname, &format!("Error: {}", e)),
+            }
+        }
+        "list" => {
+            match state.watchlist.list() {
+                Err(e) => session.server_message(&sname, &format!("Error: {}", e)),
+                Ok(entries) if entries.is_empty() => {
+                    session.server_message(&sname, "Watchlist is empty.");
+                }
+                Ok(entries) => {
+                    let lines: Vec<String> = entries.iter().map(|e| {
+                        let short = &e.hdid[..e.hdid.len().min(16)];
+                        if e.note.is_empty() {
+                            format!("{}... (added by {})", short, e.added_by)
+                        } else {
+                            format!("{}... (added by {}) — {}", short, e.added_by, e.note)
+                        }
+                    }).collect();
+                    session.server_message(&sname, &format!("Watchlist ({}):\n{}", entries.len(), lines.join("\n")));
+                }
+            }
+        }
+        _ => {
+            session.server_message(&sname, "Usage: /watchlist add <hdid> [note] | /watchlist remove <hdid> | /watchlist list");
+        }
+    }
 }

@@ -147,6 +147,31 @@ async fn handle_hi(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
         Ok(None) => {}
     }
 
+    // Check watchlist — notify all online authenticated mods if this HDID is flagged.
+    match state.watchlist.get(&hashed_hdid) {
+        Ok(Some(entry)) => {
+            let short_hdid = &hashed_hdid[..hashed_hdid.len().min(16)];
+            let alert = format!(
+                "[WATCHLIST] Watched user connected\nHDID: {}...\nAdded by: {}\nNote: {}",
+                short_hdid,
+                entry.added_by,
+                if entry.note.is_empty() { "(none)" } else { &entry.note },
+            );
+            let clients = state.clients.lock().await;
+            for handle in clients.values() {
+                if handle.authenticated {
+                    handle.send_packet("CT", &[
+                        &crate::protocol::packet::ao_encode(&state.config.server.name),
+                        &crate::protocol::packet::ao_encode(&alert),
+                        "1",
+                    ]);
+                }
+            }
+        }
+        Err(e) => warn!("Watchlist check error for IPID {}: {}", session.ipid, e),
+        Ok(None) => {}
+    }
+
     session.send_packet("ID", &["0", &state.config.server.name, VERSION]);
 }
 

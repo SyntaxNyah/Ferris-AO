@@ -13,7 +13,7 @@ use crate::{
     client::PairInfo,
     config::Config,
     game::areas::Area,
-    moderation::BanManager,
+    moderation::{BanManager, WatchlistManager},
     privacy::PrivacyLayer,
     ratelimit::TokenBucket,
     storage::EncryptedDb,
@@ -76,6 +76,7 @@ pub struct ServerState {
     pub db: Arc<EncryptedDb>,
     pub accounts: AccountManager,
     pub bans: BanManager,
+    pub watchlist: WatchlistManager,
 
     /// Pre-built SM packet string (built once at startup).
     pub sm_packet: String,
@@ -103,6 +104,7 @@ impl ServerState {
         let max = config.server.max_players;
         let accounts = AccountManager::new(Arc::clone(&db));
         let bans = BanManager::new(Arc::clone(&db));
+        let watchlist = WatchlistManager::new(Arc::clone(&db));
 
         // Initialize UID pool with all available UIDs
         let mut pool = BinaryHeap::new();
@@ -123,6 +125,7 @@ impl ServerState {
             db,
             accounts,
             bans,
+            watchlist,
             sm_packet,
             player_watch_tx,
             conn_limiters: Mutex::new(HashMap::new()),
