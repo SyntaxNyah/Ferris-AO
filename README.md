@@ -475,6 +475,170 @@ stream {
 
 With `proxy_protocol on`, nginx prepends a PP2 header so Ferris-AO can recover the real client IP. This only activates when `reverse_proxy_mode = true` — without it the server uses the peer address directly.
 
+### Disabling IP logging in nginx
+
+nginx logs the real client IP in its access log by default. To prevent this, override the log format or disable access logging entirely in the `http {}` block:
+
+```nginx
+# Option A: strip IPs from the access log
+log_format no_ip '$time_local "$request" $status $body_bytes_sent "$http_referer"';
+access_log /var/log/nginx/access.log no_ip;
+
+# Option B: disable access logging entirely
+access_log off;
+```
+
+---
+
+## Alternative Reverse Proxies
+
+If you prefer not to use nginx, the following proxies work with Ferris-AO and do **not log IP addresses by default**, making them better choices for privacy-focused deployments. Set `reverse_proxy_mode = true` in `config.toml` for all of them.
+
+### Caddy
+
+[Caddy](https://caddyserver.com/) is the simplest option. It handles TLS (Let's Encrypt) and WebSocket proxying automatically, and produces **no access logs unless you explicitly add an `access_log` directive**.
+
+**With Cloudflare (Cloudflare terminates TLS, Caddy listens on port 80):**
+
+```caddyfile
+# Caddyfile
+your.domain.example:80 {
+    reverse_proxy localhost:27018 {
+        # Cloudflare sets CF-Connecting-IP; pass it as the standard headers.
+        header_up X-Forwarded-For {http.request.header.CF-Connecting-IP}
+        header_up X-Real-IP       {http.request.header.CF-Connecting-IP}
+    }
+}
+```
+
+**Without Cloudflare (Caddy handles TLS automatically):**
+
+```caddyfile
+# Caddyfile
+your.domain.example {
+    reverse_proxy localhost:27018 {
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP       {remote_host}
+    }
+}
+```
+
+Run with:
+```bash
+caddy run --config /etc/caddy/Caddyfile
+```
+
+`config.toml` settings for Caddy + Cloudflare:
+```toml
+[network]
+ws_port = 27018
+bind_addr = "127.0.0.1"
+reverse_proxy_mode = true
+reverse_proxy_https_port = 443
+
+[master_server]
+advertise = true
+hostname = "your.domain.example"
+```
+
+---
+
+### Traefik
+
+[Traefik](https://traefik.io/) is popular for Docker deployments. Access logging is **disabled by default** — you must opt in with `--accesslog=true`.
+
+**Static configuration (`traefik.yml`):**
+
+```yaml
+entryPoints:
+  websecure:
+    address: ":443"
+
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: your@email.com
+      storage: /letsencrypt/acme.json
+      tlsChallenge: {}
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+
+# Access logging is off by default — do not add an accessLog block.
+```
+
+**Dynamic configuration (`dynamic.yml`):**
+
+```yaml
+http:
+  routers:
+    ferris-ao:
+      rule: "Host(`your.domain.example`)"
+      entryPoints:
+        - websecure
+      tls:
+        certResolver: letsencrypt
+      service: ferris-ao
+
+  services:
+    ferris-ao:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:27018"
+        passHostHeader: true
+
+  middlewares:
+    real-ip:
+      headers:
+        customRequestHeaders:
+          X-Forwarded-For: ""   # Traefik sets this automatically from the peer address
+          X-Real-IP: ""         # Set by the ForwardedHeaders middleware
+```
+
+> **Note:** With Cloudflare in front, configure Traefik's `forwardedHeaders.trustedIPs` to trust [Cloudflare's IP ranges](https://www.cloudflare.com/ips/) so `X-Forwarded-For` is not spoofable.
+
+**Docker Compose example:**
+
+```yaml
+services:
+  traefik:
+    image: traefik:v3.0
+    command:
+      - "--accesslog=false"
+      - "--providers.docker=true"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.le.acme.tlschallenge=true"
+      - "--certificatesresolvers.le.acme.email=your@email.com"
+      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
+    ports:
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./letsencrypt:/letsencrypt
+
+  ferris-ao:
+    build: .
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.ferris.rule=Host(`your.domain.example`)"
+      - "traefik.http.routers.ferris.entrypoints=websecure"
+      - "traefik.http.routers.ferris.tls.certresolver=le"
+      - "traefik.http.services.ferris.loadbalancer.server.port=27018"
+```
+
+---
+
+### Summary
+
+| Proxy | IP logging by default | TLS | WebSocket | Best for |
+|---|---|---|---|---|
+| **Caddy** | No | Automatic (Let's Encrypt) | Automatic | Simple setups, bare metal |
+| **Traefik** | No | Automatic (Let's Encrypt) | Automatic | Docker / container deployments |
+| **nginx** | **Yes** (disable with `access_log off`) | Manual (certbot) | Manual config required | High-traffic, advanced tuning |
+
+All three work with `reverse_proxy_mode = true`. The real client IP is recovered from `X-Forwarded-For` or `X-Real-IP` — Ferris-AO never sees or stores the connection's raw IP after hashing it to an IPID.
+
 ---
 
 ## Connecting
