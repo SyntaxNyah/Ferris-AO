@@ -13,9 +13,10 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio_tungstenite::{
-    accept_hdr_async,
+    accept_hdr_async_with_config,
     tungstenite::{
         handshake::server::{Request, Response},
+        protocol::WebSocketConfig,
         Message,
     },
     WebSocketStream,
@@ -139,7 +140,20 @@ async fn accept_ws(
     let extracted_ip: Arc<Mutex<Option<IpAddr>>> = Arc::new(Mutex::new(None));
     let extracted_ip_cb = Arc::clone(&extracted_ip);
 
-    let ws = accept_hdr_async(stream, move |req: &Request, mut res: Response| {
+    // Tuned WebSocket config.
+    // Write-buffer headroom: 128 KiB flush threshold, 256 KiB hard cap.
+    // These values accommodate batch-written multi-packet bursts without
+    // excessive buffering.
+    //
+    // NOTE: permessage-deflate (RFC 7692) compression is not yet available in
+    // tungstenite 0.26.  When we upgrade to a version that exposes
+    // WebSocketConfig::compression, enable it here with DeflateConfig::default()
+    // — supporting clients will negotiate it automatically; others fall back.
+    let ws_config = WebSocketConfig::default()
+        .write_buffer_size(128 * 1024)
+        .max_write_buffer_size(256 * 1024);
+
+    let ws = accept_hdr_async_with_config(stream, move |req: &Request, mut res: Response| {
         // Sub-protocol acknowledgement: if the client advertises "AO2", echo it back.
         if let Some(proto_hdr) = req.headers().get("sec-websocket-protocol") {
             if let Ok(p) = proto_hdr.to_str() {
@@ -174,7 +188,7 @@ async fn accept_ws(
             }
         }
         Ok(res)
-    })
+    }, Some(ws_config))
     .await?;
 
     let real_ip = extracted_ip.lock().unwrap().unwrap_or(peer.ip());
