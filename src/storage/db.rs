@@ -5,6 +5,115 @@ use aes_gcm::{
 use anyhow::{Context, Result};
 use redb::{Database, ReadableTable, TableDefinition};
 
+// CONFIG_TABLE key used to track how many key rotations have occurred.
+// Value: 8-byte little-endian u64.  Absent on first run (treated as 0).
+const KEY_ROTATION_COUNTER_KEY: &str = "key_rotation_counter";
+
+/// Derive a per-session AES-256 key from the master key and a rotation counter.
+///
+/// Uses HMAC-SHA256 as a simple KDF: `HMAC-SHA256(master, "nyahao-session-<hex_counter>")`.
+/// The master key never touches disk; only the counter (plaintext) is persisted.
+/// Each restart increments the counter → the session key changes every restart,
+/// giving forward secrecy at the session level.
+fn derive_session_key(master: &[u8; 32], counter: u64) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let label = format!("nyahao-session-{:016x}", counter);
+    let mut mac = <Hmac<Sha256> as hmac::Mac>::new_from_slice(master)
+        .expect("HMAC accepts any key size");
+    mac.update(label.as_bytes());
+    let result = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
+}
+
+// ── Free-standing encrypt/decrypt helpers (work on any Aes256Gcm instance) ──
+
+fn encrypt_with(cipher: &Aes256Gcm, plaintext: &[u8]) -> Result<Vec<u8>> {
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let ciphertext = cipher
+        .encrypt(&nonce, plaintext)
+        .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
+    let mut out = Vec::with_capacity(12 + ciphertext.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+fn decrypt_with(cipher: &Aes256Gcm, data: &[u8]) -> Result<Vec<u8>> {
+    if data.len() < 13 {
+        anyhow::bail!("Ciphertext too short");
+    }
+    let (nonce_bytes, ciphertext) = data.split_at(12);
+    let nonce = Nonce::from_slice(nonce_bytes);
+    cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))
+}
+
+// ── Per-table re-encryption helpers ──────────────────────────────────────────
+
+fn reencrypt_u64_table(
+    db: &Database,
+    table_def: TableDefinition<u64, &[u8]>,
+    old: &Aes256Gcm,
+    new: &Aes256Gcm,
+) -> Result<()> {
+    // 1. Read all records with old cipher.
+    let pairs: Vec<(u64, Vec<u8>)> = {
+        let rtxn = db.begin_read()?;
+        let tbl = rtxn.open_table(table_def)?;
+        let mut v = Vec::new();
+        for item in tbl.iter()? {
+            let (k, val) = item?;
+            let plain = decrypt_with(old, val.value())?;
+            v.push((k.value(), plain));
+        }
+        v
+    };
+    // 2. Write re-encrypted records.
+    let wtxn = db.begin_write()?;
+    {
+        let mut tbl = wtxn.open_table(table_def)?;
+        for (k, plain) in &pairs {
+            let enc = encrypt_with(new, plain)?;
+            tbl.insert(*k, enc.as_slice())?;
+        }
+    }
+    wtxn.commit()?;
+    Ok(())
+}
+
+fn reencrypt_str_table(
+    db: &Database,
+    table_def: TableDefinition<&str, &[u8]>,
+    old: &Aes256Gcm,
+    new: &Aes256Gcm,
+) -> Result<()> {
+    let pairs: Vec<(String, Vec<u8>)> = {
+        let rtxn = db.begin_read()?;
+        let tbl = rtxn.open_table(table_def)?;
+        let mut v = Vec::new();
+        for item in tbl.iter()? {
+            let (k, val) = item?;
+            let plain = decrypt_with(old, val.value())?;
+            v.push((k.value().to_owned(), plain));
+        }
+        v
+    };
+    let wtxn = db.begin_write()?;
+    {
+        let mut tbl = wtxn.open_table(table_def)?;
+        for (k, plain) in &pairs {
+            let enc = encrypt_with(new, plain)?;
+            tbl.insert(k.as_str(), enc.as_slice())?;
+        }
+    }
+    wtxn.commit()?;
+    Ok(())
+}
+
 // Table definitions
 pub const CONFIG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("config");
 pub const BANS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("bans");
@@ -19,49 +128,106 @@ pub struct EncryptedDb {
 }
 
 impl EncryptedDb {
-    pub fn open(path: &str, key_bytes: &[u8; 32]) -> Result<Self> {
+    /// Open the database and perform a key rotation.
+    ///
+    /// ## Key rotation
+    ///
+    /// On every startup, the session encryption key is rotated:
+    ///
+    /// 1. Read `key_rotation_counter` from the config table (default 0).
+    /// 2. Derive `old_session_key = HMAC-SHA256(master_key, "nyahao-session-<counter>")`.
+    ///    First run (counter absent) uses `master_key` directly for backward compat.
+    /// 3. Increment the counter.
+    /// 4. Derive `new_session_key = HMAC-SHA256(master_key, "nyahao-session-<new_counter>")`.
+    /// 5. Re-encrypt all encrypted tables from old key → new key in single transactions.
+    /// 6. Persist the new counter.
+    /// 7. Use `new_session_key` as the active cipher for this process lifetime.
+    ///
+    /// Forward secrecy: the in-memory session key changes every restart.
+    /// A memory dump from session N cannot decrypt session N+1 data.
+    /// The master key (`NYAHAO_DB_KEY`) never touches disk.
+    pub fn open(path: &str, master_key: &[u8; 32]) -> Result<Self> {
         let db = Database::create(path).context("Failed to open database")?;
-        let key = Key::<Aes256Gcm>::from_slice(key_bytes);
-        let cipher = Aes256Gcm::new(key);
 
-        // Ensure tables exist
-        let write_txn = db.begin_write()?;
+        // Ensure all tables exist.
         {
-            write_txn.open_table(CONFIG_TABLE)?;
-            write_txn.open_table(BANS_TABLE)?;
-            write_txn.open_table(BANS_BY_HDID_TABLE)?;
-            write_txn.open_table(ACCOUNTS_TABLE)?;
-            write_txn.open_table(WATCHLIST_TABLE)?;
-            write_txn.open_table(IPID_BANS_TABLE)?;
+            let txn = db.begin_write()?;
+            txn.open_table(CONFIG_TABLE)?;
+            txn.open_table(BANS_TABLE)?;
+            txn.open_table(BANS_BY_HDID_TABLE)?;
+            txn.open_table(ACCOUNTS_TABLE)?;
+            txn.open_table(WATCHLIST_TABLE)?;
+            txn.open_table(IPID_BANS_TABLE)?;
+            txn.commit()?;
         }
-        write_txn.commit()?;
 
-        Ok(Self { inner: db, cipher })
+        // Read current rotation counter.
+        let counter_opt: Option<u64> = {
+            let rtxn = db.begin_read()?;
+            let tbl = rtxn.open_table(CONFIG_TABLE)?;
+            tbl.get(KEY_ROTATION_COUNTER_KEY)?
+                .map(|v| {
+                    let b = v.value();
+                    if b.len() >= 8 {
+                        u64::from_le_bytes(b[..8].try_into().unwrap())
+                    } else {
+                        0
+                    }
+                })
+        };
+
+        let new_counter = counter_opt.map(|c| c.wrapping_add(1)).unwrap_or(1);
+
+        // Build old cipher.  On first-ever rotation (counter absent) we used the
+        // raw master key, so we must decrypt with it directly.
+        let old_cipher = if let Some(counter) = counter_opt {
+            let k = derive_session_key(master_key, counter);
+            Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&k))
+        } else {
+            Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(master_key))
+        };
+
+        let new_key_bytes = derive_session_key(master_key, new_counter);
+        let new_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&new_key_bytes));
+
+        // Re-encrypt every encrypted table.
+        reencrypt_u64_table(&db, BANS_TABLE, &old_cipher, &new_cipher)
+            .context("Key rotation failed on bans table")?;
+        reencrypt_str_table(&db, ACCOUNTS_TABLE, &old_cipher, &new_cipher)
+            .context("Key rotation failed on accounts table")?;
+        reencrypt_str_table(&db, WATCHLIST_TABLE, &old_cipher, &new_cipher)
+            .context("Key rotation failed on watchlist table")?;
+        reencrypt_str_table(&db, IPID_BANS_TABLE, &old_cipher, &new_cipher)
+            .context("Key rotation failed on ipid_bans table")?;
+
+        // Persist new counter.
+        {
+            let wtxn = db.begin_write()?;
+            {
+                let mut tbl = wtxn.open_table(CONFIG_TABLE)?;
+                tbl.insert(KEY_ROTATION_COUNTER_KEY, new_counter.to_le_bytes().as_slice())?;
+            }
+            wtxn.commit()?;
+        }
+
+        tracing::info!(
+            "DB key rotation complete: session {} → {}",
+            counter_opt.unwrap_or(0),
+            new_counter
+        );
+
+        Ok(Self { inner: db, cipher: new_cipher })
     }
 
-    /// Encrypt plaintext. Prepends a random 12-byte nonce to the ciphertext.
+    /// Encrypt plaintext with the current session key.
+    /// Prepends a random 12-byte nonce to the ciphertext.
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-        let ciphertext = self
-            .cipher
-            .encrypt(&nonce, plaintext)
-            .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
-        let mut out = Vec::with_capacity(12 + ciphertext.len());
-        out.extend_from_slice(&nonce);
-        out.extend_from_slice(&ciphertext);
-        Ok(out)
+        encrypt_with(&self.cipher, plaintext)
     }
 
-    /// Decrypt data (first 12 bytes are the nonce).
+    /// Decrypt data encrypted with the current session key (first 12 bytes = nonce).
     pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
-        if data.len() < 13 {
-            anyhow::bail!("Ciphertext too short");
-        }
-        let (nonce_bytes, ciphertext) = data.split_at(12);
-        let nonce = Nonce::from_slice(nonce_bytes);
-        self.cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))
+        decrypt_with(&self.cipher, data)
     }
 
     /// Read raw (unencrypted) bytes from the config table.
