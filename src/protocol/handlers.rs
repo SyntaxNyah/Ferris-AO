@@ -313,7 +313,6 @@ async fn handle_rd(session: &mut ClientSession, state: &Arc<ServerState>) {
         session.send_packet("HP", &["1", &area.def_hp.to_string()]);
         session.send_packet("HP", &["2", &area.pro_hp.to_string()]);
         session.send_packet("BN", &[&bg]);
-        session.send_packet("BB", &[&bg]);
     }
 
     // Send DONE

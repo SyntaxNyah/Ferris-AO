@@ -230,7 +230,6 @@ pub async fn change_area(session: &mut ClientSession, state: &Arc<ServerState>, 
         session.send_packet("HP", &["1", &new_area.def_hp.to_string()]);
         session.send_packet("HP", &["2", &new_area.pro_hp.to_string()]);
         session.send_packet("BN", &[&bg]);
-        session.send_packet("BB", &[&bg]);
 
         let evi = new_area.evidence.clone();
         let evi_refs: Vec<&str> = evi.iter().map(|s| s.as_str()).collect();
