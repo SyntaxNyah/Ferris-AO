@@ -1182,8 +1182,10 @@ pub async fn run_client(
 ) {
     use tokio::sync::mpsc;
 
-    // Outbound channel: all sends from handlers go here; write task forwards to transport.
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    // Bounded outbound channel — provides backpressure against slow clients.
+    // When the queue is full, try_send drops new packets rather than growing without bound.
+    let cap = state.config.server.outbound_queue_cap.max(4);
+    let (tx, mut rx) = mpsc::channel::<String>(cap);
 
     // Compute IPID from the real IP (privacy layer: raw IP is dropped after this).
     let ipid = state.privacy.compute_ipid(&real_ip.to_string());
@@ -1214,18 +1216,46 @@ pub async fn run_client(
     loop {
         tokio::select! {
             // Forward outbound messages — intercept internal control messages.
+            // Packet batching: after the first message arrives, drain everything
+            // already queued (non-blocking) and concatenate into a single write.
+            // For both TCP and WebSocket, AO2 clients split on '%' so multiple
+            // back-to-back packets in one frame are handled correctly.
             Some(msg) = rx.recv() => {
-                // Internal cross-task control messages start with "__".
-                // Do NOT send them to the wire; dispatch them locally.
+                let mut outbound = String::new();
+
+                // Process first message.
                 if msg.starts_with("__") {
-                    // Strip the trailing "#%" if present before using as header.
                     let header = msg.trim_end_matches("#%").trim_end_matches('#');
                     handle_internal(&mut session, &state, header).await;
-                    continue;
+                } else {
+                    outbound.push_str(&msg);
                 }
-                if let Err(e) = transport.send(&msg).await {
-                    debug!("Send error: {}", e);
-                    break;
+
+                // Drain any already-queued messages without blocking.
+                loop {
+                    match rx.try_recv() {
+                        Ok(m) if m.starts_with("__") => {
+                            // Flush pending wire data before the internal message.
+                            if !outbound.is_empty() {
+                                if let Err(e) = transport.send(&outbound).await {
+                                    debug!("Send error (batch flush): {}", e);
+                                    break;
+                                }
+                                outbound.clear();
+                            }
+                            let header = m.trim_end_matches("#%").trim_end_matches('#');
+                            handle_internal(&mut session, &state, header).await;
+                        }
+                        Ok(m) => outbound.push_str(&m),
+                        Err(_) => break,
+                    }
+                }
+
+                if !outbound.is_empty() {
+                    if let Err(e) = transport.send(&outbound).await {
+                        debug!("Send error: {}", e);
+                        break;
+                    }
                 }
             }
 

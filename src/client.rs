@@ -1,5 +1,5 @@
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, Sender};
 
 use crate::ratelimit::TokenBucket;
 
@@ -99,14 +99,14 @@ pub struct ClientSession {
     /// Duration between allowed mod calls (from config).
     pub zz_cooldown: Duration,
 
-    // Outbound message sender
-    pub tx: mpsc::UnboundedSender<String>,
+    // Outbound message sender (bounded — provides backpressure against slow clients).
+    pub tx: Sender<String>,
 }
 
 impl ClientSession {
     pub fn new(
         ipid: String,
-        tx: mpsc::UnboundedSender<String>,
+        tx: Sender<String>,
         rl: &crate::config::RateLimitsConfig,
     ) -> Self {
         Self {
@@ -142,8 +142,10 @@ impl ClientSession {
     }
 
     /// Send a raw wire-format string to this client.
+    /// Uses `try_send`; if the outbound channel is full the packet is silently
+    /// dropped (the client will be cleaned up by the keepalive timeout).
     pub fn send_raw(&self, msg: impl Into<String>) {
-        let _ = self.tx.send(msg.into());
+        let _ = self.tx.try_send(msg.into());
     }
 
     /// Send a packet.

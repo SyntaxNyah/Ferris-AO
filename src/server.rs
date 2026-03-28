@@ -5,7 +5,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
-use tokio::sync::{mpsc, watch, Mutex, RwLock};
+use tokio::sync::{mpsc, mpsc::Sender, watch, Mutex, RwLock};
 use std::collections::HashMap;
 
 use std::collections::HashSet;
@@ -57,7 +57,7 @@ pub struct ClientHandle {
     pub hdid: Option<String>,
     pub char_id: Option<usize>,
     pub authenticated: bool,
-    pub tx: mpsc::UnboundedSender<String>,
+    pub tx: Sender<String>,
     // Pairing — updated after each IC message and by /pair//unpair
     pub pair_wanted_id: Option<usize>,
     pub force_pair_uid: Option<u32>,
@@ -68,8 +68,10 @@ pub struct ClientHandle {
 }
 
 impl ClientHandle {
+    /// Queue a message for this client.  Silently drops on a full channel;
+    /// the keepalive timeout will eventually clean up a persistently slow client.
     pub fn send(&self, msg: &str) {
-        let _ = self.tx.send(msg.to_string());
+        let _ = self.tx.try_send(msg.to_string());
     }
 
     pub fn send_packet(&self, header: &str, args: &[&str]) {

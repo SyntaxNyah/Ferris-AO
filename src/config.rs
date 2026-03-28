@@ -29,6 +29,14 @@ pub struct ServerConfig {
     /// are dropped before parsing. Default: 8192.
     #[serde(default = "default_max_packet_bytes")]
     pub max_packet_bytes: usize,
+
+    /// Maximum number of packets allowed in a client's outbound queue at once.
+    /// When the queue is full, additional sends are silently dropped and the
+    /// client is eventually cleaned up by the keepalive timeout.
+    /// Increase this if fast-moving areas generate legitimate bursts; decrease
+    /// it to shed slow consumers sooner.  Default: 256.
+    #[serde(default = "default_outbound_queue_cap")]
+    pub outbound_queue_cap: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +68,7 @@ fn default_https_port() -> u16 { 443 }
 fn default_ws_ping_interval() -> u64 { 30 }
 fn default_ws_ping_timeout() -> u64 { 90 }
 fn default_max_packet_bytes() -> usize { 8192 }
+fn default_outbound_queue_cap() -> usize { 256 }
 
 #[derive(Debug, Deserialize)]
 pub struct PrivacyConfig {
