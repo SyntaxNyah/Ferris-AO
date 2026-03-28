@@ -1,0 +1,61 @@
+# /etc/nginx/sites-available/miku.pizza
+#
+# Main domain — orange-clouded in Cloudflare (proxied, CDN).
+# Replace miku.pizza with your own main domain.
+#
+# Serves the AO2 asset bundle: character sprites, music, backgrounds.
+# Cloudflare caches these files globally so players download them fast.
+# Set asset_url = "https://miku.pizza/assets" in Ferris-AO config.toml.
+#
+# TLS certificate: this domain is orange-clouded, so certbot's HTTP-01
+# challenge can't reach the VPS through Cloudflare. Use a Cloudflare
+# Origin Certificate instead:
+#   1. Cloudflare dashboard → SSL/TLS → Origin Server → Create Certificate
+#   2. Save the cert  → /etc/ssl/cloudflare/miku.pizza.pem
+#      Save the key   → /etc/ssl/cloudflare/miku.pizza.key
+#   3. Set Cloudflare SSL/TLS mode to Full (strict)
+#
+# SETUP:
+#   1. Copy to /etc/nginx/sites-available/miku.pizza
+#   2. Edit server_name and ssl_certificate paths to your domain
+#   3. sudo ln -s /etc/nginx/sites-available/miku.pizza \
+#                 /etc/nginx/sites-enabled/miku.pizza
+#   4. sudo nginx -t && sudo systemctl reload nginx
+
+# ── Port 80: redirect to HTTPS ────────────────────────────────────────────────
+server {
+    listen 80;
+    listen [::]:80;
+    server_name miku.pizza;   # ← replace with your main domain
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# ── Port 443: serve asset files ───────────────────────────────────────────────
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name miku.pizza;   # ← replace with your main domain
+
+    # Cloudflare Origin Certificate (generated in Cloudflare dashboard).
+    ssl_certificate     /etc/ssl/cloudflare/miku.pizza.pem;
+    ssl_certificate_key /etc/ssl/cloudflare/miku.pizza.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    # Asset bundle root. Put your AO2 assets here:
+    #   /var/www/assets/characters/
+    #   /var/www/assets/music/
+    #   /var/www/assets/backgrounds/
+    root /var/www/assets;
+
+    location / {
+        try_files $uri $uri/ =404;
+        # Allow Cloudflare to cache asset files for 24 hours.
+        add_header Cache-Control "public, max-age=86400";
+    }
+}

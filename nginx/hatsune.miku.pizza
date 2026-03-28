@@ -1,0 +1,84 @@
+# /etc/nginx/sites-available/hatsune.miku.pizza
+#
+# Game subdomain — gray-clouded in Cloudflare (DNS only, direct to VPS).
+# Replace hatsune.miku.pizza with your own game subdomain.
+#
+# Players connect here:
+#   AO2 desktop  → TCP port 27017 (bypasses nginx, direct to Ferris-AO)
+#   WebAO ws://  → port 80  → nginx → Ferris-AO ws_port (27018)
+#   WebAO wss:// → port 443 → nginx → Ferris-AO ws_port (27018, same listener)
+#
+# Must be gray-clouded so:
+#   - TCP port 27017 reaches the VPS directly (Cloudflare can't proxy TCP free tier)
+#   - certbot HTTP-01 challenge can reach the VPS on port 80
+#
+# SETUP:
+#   1. Copy to /etc/nginx/sites-available/hatsune.miku.pizza
+#   2. Edit server_name to your subdomain
+#   3. sudo ln -s /etc/nginx/sites-available/hatsune.miku.pizza \
+#                 /etc/nginx/sites-enabled/hatsune.miku.pizza
+#   4. sudo nginx -t && sudo systemctl reload nginx
+#   5. sudo certbot --nginx -d hatsune.miku.pizza
+#      (certbot will fill in the ssl_certificate paths automatically)
+
+# ── Port 80: plain ws:// WebSocket + certbot ACME + redirect ─────────────────
+server {
+    listen 80;
+    listen [::]:80;
+    server_name hatsune.miku.pizza;   # ← replace with your game subdomain
+
+    # Certbot writes ACME challenge files here during cert renewal.
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    # WebSocket upgrade (ws://) → proxy to Ferris-AO.
+    # Plain browser HTTP → redirect to https://.
+    location / {
+        if ($http_upgrade = "websocket") {
+            proxy_pass http://127.0.0.1:27018;
+        }
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade    $http_upgrade;
+        proxy_set_header   Connection "upgrade";
+        proxy_set_header   Host       $host;
+        proxy_set_header   X-Real-IP       $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 7200s;
+        proxy_send_timeout 30s;
+        proxy_buffering    off;
+
+        return 301 https://$host$request_uri;
+    }
+}
+
+# ── Port 443: wss:// WebSocket (TLS) ─────────────────────────────────────────
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name hatsune.miku.pizza;   # ← replace with your game subdomain
+
+    # Paths filled in automatically by certbot.
+    ssl_certificate     /etc/letsencrypt/live/hatsune.miku.pizza/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/hatsune.miku.pizza/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    # Do not log IPs — Ferris-AO hashes them internally.
+    access_log off;
+
+    location / {
+        proxy_pass         http://127.0.0.1:27018;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade    $http_upgrade;
+        proxy_set_header   Connection "upgrade";
+        proxy_set_header   Host       $host;
+        proxy_set_header   X-Real-IP       $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 7200s;   # Keep WebSocket alive for long RP sessions
+        proxy_send_timeout 30s;
+        proxy_buffering    off;
+    }
+}

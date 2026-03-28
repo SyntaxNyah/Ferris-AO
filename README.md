@@ -507,29 +507,39 @@ sudo apt install nginx certbot python3-certbot-nginx
 
 ---
 
-#### Step 3 — Create the nginx config
+#### Step 3 — Create the nginx site configs
 
-Create the file `/etc/nginx/sites-available/ferris-ao` with the contents below (or copy `nginx/nyahao.conf` from this repo and edit the domain names).
+Each domain gets its own file under `/etc/nginx/sites-available/`. Example files are in the `nginx/` directory of this repo.
 
-This is the **complete nginx config** — two site blocks for `hatsune.miku.pizza` (game) and one for `miku.pizza` (assets):
+---
+
+**`/etc/nginx/sites-available/hatsune.miku.pizza`** — game server (gray cloud, players connect here)
 
 ```nginx
-# ── hatsune.miku.pizza — port 80 ─────────────────────────────────────────────
-# WebSocket clients using ws:// connect here.
-# Also handles certbot ACME challenges for TLS cert renewal.
-# Non-WebSocket HTTP requests are redirected to https://.
+# hatsune.miku.pizza — game subdomain (gray cloud, direct to VPS)
+#
+# Players connect here for the actual game:
+#   - AO2 desktop: TCP port 27017 (bypasses nginx entirely, direct to Ferris-AO)
+#   - WebAO ws://:  port 80  → nginx → Ferris-AO ws_port
+#   - WebAO wss://: port 443 → nginx → Ferris-AO ws_port  (same listener!)
+#
+# Must be gray-clouded in Cloudflare so:
+#   - TCP port 27017 reaches the VPS directly (Cloudflare can't proxy TCP free tier)
+#   - certbot HTTP-01 challenge can reach the VPS on port 80
+
+# ── Port 80: plain ws:// WebSocket + certbot ACME + redirect ─────────────────
 server {
     listen 80;
     listen [::]:80;
     server_name hatsune.miku.pizza;
 
-    # Certbot writes challenge files here during renewal.
+    # Certbot writes ACME challenge files here during cert renewal.
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
     }
 
-    # Proxy WebSocket upgrades (ws://) to Ferris-AO.
-    # Redirect plain browser HTTP to HTTPS.
+    # WebSocket upgrade (ws://) → proxy to Ferris-AO.
+    # Plain browser HTTP → redirect to https://.
     location / {
         if ($http_upgrade = "websocket") {
             proxy_pass http://127.0.0.1:27018;
@@ -548,14 +558,13 @@ server {
     }
 }
 
-# ── hatsune.miku.pizza — port 443 ────────────────────────────────────────────
-# WebSocket clients using wss:// (secure) connect here.
-# certbot fills in the ssl_certificate paths automatically.
+# ── Port 443: wss:// WebSocket (TLS) ─────────────────────────────────────────
 server {
     listen 443 ssl;
     listen [::]:443 ssl;
     server_name hatsune.miku.pizza;
 
+    # Paths filled in automatically by: sudo certbot --nginx -d hatsune.miku.pizza
     ssl_certificate     /etc/letsencrypt/live/hatsune.miku.pizza/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/hatsune.miku.pizza/privkey.pem;
     ssl_protocols       TLSv1.2 TLSv1.3;
@@ -563,7 +572,7 @@ server {
     ssl_session_cache   shared:SSL:10m;
     ssl_session_timeout 1d;
 
-    # Do not log real IPs — Ferris-AO hashes them internally.
+    # Do not log IPs — Ferris-AO hashes them internally and never stores raw addresses.
     access_log off;
 
     location / {
@@ -574,65 +583,79 @@ server {
         proxy_set_header   Host       $host;
         proxy_set_header   X-Real-IP       $remote_addr;
         proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_read_timeout 7200s;
+        proxy_read_timeout 7200s;   # Keep WebSocket alive for long RP sessions
         proxy_send_timeout 30s;
         proxy_buffering    off;
     }
 }
+```
 
-# ── miku.pizza — asset server ─────────────────────────────────────────────────
-# Serves the asset bundle (characters, music, backgrounds).
-# Orange-clouded in Cloudflare — Cloudflare CDN caches and serves these files.
-# certbot fills in the ssl_certificate paths automatically.
+Both port 80 and port 443 forward to the **same** `localhost:27018` Ferris-AO listener. Only one WebSocket process is needed.
+
+---
+
+**`/etc/nginx/sites-available/miku.pizza`** — asset server (orange cloud, CDN)
+
+```nginx
+# miku.pizza — main domain (orange cloud, Cloudflare CDN)
+#
+# Serves the AO2 asset bundle: character sprites, music, backgrounds.
+# Cloudflare caches these files globally so players download them fast.
+# This domain never handles game protocol traffic.
+#
+# TLS certificate: because this domain is orange-clouded, certbot's
+# HTTP-01 challenge won't reach the VPS. Use a Cloudflare Origin
+# Certificate instead (SSL/TLS → Origin Server → Create Certificate).
+# Set Cloudflare SSL mode to Full (strict).
+
+# ── Port 80: redirect to HTTPS ────────────────────────────────────────────────
 server {
     listen 80;
     listen [::]:80;
     server_name miku.pizza;
-
-    # Certbot ACME challenge.
-    location /.well-known/acme-challenge/ {
-        root /var/www/certbot;
-    }
 
     location / {
         return 301 https://$host$request_uri;
     }
 }
 
+# ── Port 443: serve asset files ───────────────────────────────────────────────
 server {
     listen 443 ssl;
     listen [::]:443 ssl;
     server_name miku.pizza;
 
-    ssl_certificate     /etc/letsencrypt/live/miku.pizza/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/miku.pizza/privkey.pem;
+    # Cloudflare Origin Certificate paths (replace with your actual paths).
+    # Generate at: Cloudflare dashboard → SSL/TLS → Origin Server → Create Certificate
+    ssl_certificate     /etc/ssl/cloudflare/miku.pizza.pem;
+    ssl_certificate_key /etc/ssl/cloudflare/miku.pizza.key;
     ssl_protocols       TLSv1.2 TLSv1.3;
     ssl_ciphers         HIGH:!aNULL:!MD5;
     ssl_session_cache   shared:SSL:10m;
     ssl_session_timeout 1d;
 
-    # Serve asset files from this directory.
-    # Put your AO2 asset bundle here: characters/, music/, backgrounds/, etc.
+    # Asset bundle root — put your AO2 assets here:
+    #   /var/www/assets/characters/
+    #   /var/www/assets/music/
+    #   /var/www/assets/backgrounds/
     root /var/www/assets;
-    index index.html;
 
     location / {
         try_files $uri $uri/ =404;
-        # Allow Cloudflare to cache these files aggressively.
+        # Tell Cloudflare it can cache these files for 24 hours.
         add_header Cache-Control "public, max-age=86400";
     }
 }
 ```
 
-Both game server blocks (`hatsune.miku.pizza` ports 80 and 443) forward to the **same** `localhost:27018` listener. Only one Ferris-AO WebSocket process is needed regardless of whether players connect with `ws://` or `wss://`.
-
 ---
 
-#### Step 4 — Enable the site and reload nginx
+#### Step 4 — Enable both sites and reload nginx
 
 ```bash
-# Symlink into sites-enabled
-sudo ln -s /etc/nginx/sites-available/ferris-ao /etc/nginx/sites-enabled/ferris-ao
+# Symlink both configs into sites-enabled
+sudo ln -s /etc/nginx/sites-available/hatsune.miku.pizza /etc/nginx/sites-enabled/hatsune.miku.pizza
+sudo ln -s /etc/nginx/sites-available/miku.pizza         /etc/nginx/sites-enabled/miku.pizza
 
 # Test the config syntax
 sudo nginx -t
@@ -735,7 +758,9 @@ hatsune.miku.pizza  (game subdomain, gray cloud)
                (TLS terminated by nginx using Let's Encrypt cert)
 ```
 
-The full annotated nginx config is also at `nginx/nyahao.conf` in this repo.
+Example configs for both domains are in the `nginx/` directory of this repo:
+- `nginx/hatsune.miku.pizza` — game subdomain (ws:// + wss://)
+- `nginx/miku.pizza` — asset CDN domain
 
 ---
 
