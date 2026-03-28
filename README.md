@@ -1042,11 +1042,21 @@ With `proxy_protocol on`, nginx prepends a PROXY Protocol v2 header so Ferris-AO
 | Transport | Default Port | Notes |
 |---|---|---|
 | TCP | `27017` | Used by AO2 desktop clients (e.g. Attorney Online 2) |
-| WebSocket | `27018` | Used by web clients; expose via nginx + TLS on port 443 |
+| WebSocket | `27018` | Used by web clients (WebAO); expose via nginx + TLS on port 443 |
 
 In the AO2 client, add the server as:
 - **IP:** your server's IP or domain
 - **Port:** 27017 (TCP) or 443 (WebSocket via nginx)
+
+### WebAO
+
+[WebAO](https://github.com/AttorneyOnlineVidya/webAO) is a browser-based AO2 client that connects over WebSocket. Ferris-AO supports full WebAO interoperability — WebAO and AO2 desktop clients can share the same area and see each other's IC messages in real time.
+
+To connect with WebAO, point it at the WebSocket endpoint:
+- `ws://your-domain:27018` (plain, no TLS)
+- `wss://your-domain:443` (TLS via nginx — recommended for production)
+
+WebAO clients and AO2 clients join the same areas, see each other's IC and OOC messages, share evidence, and play music together with no additional configuration.
 
 ---
 
@@ -1195,7 +1205,7 @@ HDIDs are sent by the AO2 client as a persistent hardware fingerprint. Ferris-AO
 
 ## Protocol Support
 
-Ferris-AO advertises the following AO2 feature flags to connecting clients:
+Ferris-AO advertises the following AO2 feature flags to connecting clients.  All flags are sent to both TCP (AO2 desktop) and WebSocket (WebAO) clients.  The server broadcast format correctly includes all 30 IC body fields — including the `effects` field at position 29 — so WebAO clients receive and display IC messages from all participants.
 
 | Flag | Description |
 |---|---|

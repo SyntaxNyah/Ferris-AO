@@ -740,3 +740,23 @@ One background folder name per line.
 9. **UID pool:** UIDs are `u32` values managed as a min-heap. They are allocated on join and returned on disconnect for reuse. `u32::MAX` is used as a sentinel for "no UID" in some contexts.
 
 10. **`max_players` per area vs global:** `config.server.max_players` is the global cap. `area.max_players` is optional per-area. Both are checked independently in `handle_cc`.
+
+11. **WebAO `handleMS` field count:** WebAO passes `f_contents` (the full `#`-split packet **including the header token at index 0**) directly as the `args` array. So `args.length` = number of body fields + 1. WebAO's handler checks `args.length > 29` (i.e. at least 30 elements) before reading the `effects` field at `args[30]`. The server broadcast must therefore include **30 body fields** (indices 0–29) so that `f_contents.length == 31` and `args[30]` is valid. Missing the final `effects` field (`args[29]` = client field `[25]`) causes `args[30]` to be `undefined`, crashing `handleMS` silently and making WebAO clients unable to see any IC messages. The current broadcast in `handle_ms` (`src/protocol/handlers.rs`) is correct — do not remove the `client_args[25]` push at the end of the args construction block.
+
+12. **MS broadcast field layout (server → client, 30 fields, 0-indexed):**
+    ```
+    [0..=16]  deskmod … other_charid (client fields 0–16 forwarded as-is)
+    [17]      OTHER_NAME   (server-inserted; pairing logic fills this)
+    [18]      OTHER_EMOTE  (server-inserted; pairing logic fills this)
+    [19]      SELF_OFFSET  ← client [17]
+    [20]      OTHER_OFFSET (server-inserted; pairing logic fills this)
+    [21]      OTHER_FLIP   (server-inserted; pairing logic fills this)
+    [22]      IMMEDIATE    ← client [18]  (noninterrupting_preanim)
+    [23]      LOOPING_SFX  ← client [19]
+    [24]      SCREENSHAKE  ← client [20]
+    [25]      FRAME_SCREENSHAKE ← client [21]
+    [26]      FRAME_REALIZATION ← client [22]
+    [27]      FRAME_SFX    ← client [23]
+    [28]      ADDITIVE     ← client [24]
+    [29]      EFFECTS      ← client [25]   ← must be present for WebAO
+    ```
