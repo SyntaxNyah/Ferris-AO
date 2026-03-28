@@ -38,7 +38,8 @@ async fn main() -> Result<()> {
     let config = Config::load(config_path).context("Failed to load config.toml")?;
 
     // ── Init tracing ───────────────────────────────────────────────────────────
-    let filter = EnvFilter::try_new(&config.logging.log_level)
+    let filter = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new(&config.logging.log_level))
         .unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
