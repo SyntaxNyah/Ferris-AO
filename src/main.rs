@@ -25,7 +25,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::{
     config::Config,
-    game::{areas::load_areas, characters::build_sm_packet, characters::load_lines},
+    game::{areas::load_areas, characters::build_sm_packet, characters::load_censor_words, characters::load_lines},
     privacy::hashing::PrivacyLayer,
     server::{ReloadableData, ServerState},
     storage::db::EncryptedDb,
@@ -110,11 +110,14 @@ async fn main() -> Result<()> {
     let areas_raw = load_areas(Path::new("data/areas.toml"), characters.len())
         .context("Failed to load data/areas.toml")?;
 
+    let censor_words = load_censor_words(Path::new("data/censor.txt"));
+
     info!(
-        "Loaded {} characters, {} music entries, {} areas.",
+        "Loaded {} characters, {} music entries, {} areas, {} censor words.",
         characters.len(),
         music.len(),
-        areas_raw.len()
+        areas_raw.len(),
+        censor_words.len(),
     );
 
     // Build SM packet (pre-computed; sent to every joining client).
@@ -122,7 +125,7 @@ async fn main() -> Result<()> {
     let sm_packet = build_sm_packet(&area_names, &music);
 
     // Bundle hot-reloadable data.
-    let reloadable = ReloadableData { characters, music, backgrounds, sm_packet };
+    let reloadable = ReloadableData { characters, music, backgrounds, sm_packet, censor_words };
 
     // Wrap areas in Arc<RwLock<_>>.
     let areas: Vec<Arc<tokio::sync::RwLock<crate::game::areas::Area>>> = areas_raw

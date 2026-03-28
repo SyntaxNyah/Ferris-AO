@@ -58,6 +58,7 @@ Ferris-AO is a server backend for the AO2 protocol. It manages areas (rooms), ch
 - **WebSocket keepalive** — Configurable Ping/Pong intervals to detect and drop stale connections
 - **PROXY Protocol v2** — Recovers real client IPs when running behind nginx (required for accurate IPIDs behind a proxy)
 - **Cloudflare-ready** — WebSocket proxy handles `CF-Connecting-IP` and `X-Real-IP` headers (trusted only from loopback)
+- **Word censor** — Optional `data/censor.txt` word list; IC messages containing a censored word are silently intercepted (shown to the sender as sent, not broadcast to others)
 - **Packet size enforcement** — Configurable hard limit on incoming packet bytes; oversized packets are dropped before parsing
 - **Aggressive release optimization** — LTO + single codegen unit for minimal binary size and maximum throughput
 
@@ -186,6 +187,12 @@ When `reverse_proxy_mode = true`, the server advertises `wss_port` (the `reverse
 
 The server posts immediately on startup, every 5 minutes, and whenever the player count changes.
 
+### `[censor]`
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `false` | When `true`, IC messages containing any word from `data/censor.txt` are silently intercepted — the sender sees their message as delivered but it is not broadcast to others. Has no effect if `data/censor.txt` is absent or contains no active words. |
+
 ### `[logging]`
 
 | Key | Type | Default | Description |
@@ -220,6 +227,9 @@ ws_ping_timeout_secs = 90
 [logging]
 log_level = "info"
 log_chat = false
+
+[censor]
+enabled = false
 
 [master_server]
 advertise = true
@@ -332,6 +342,24 @@ cross.opus
 Logic and Trick
 logic.opus
 ```
+
+### `data/censor.txt`
+
+Optional. One word or phrase per line. Lines that are blank or start with `#` are ignored. Matching is **case-insensitive** and checks whether the word appears **anywhere** in the IC message text.
+
+```
+# Lines starting with # are comments
+badword
+offensive phrase
+```
+
+Enable the filter in `config.toml`:
+```toml
+[censor]
+enabled = true
+```
+
+The censor list is hot-reloadable via `/reload` without restarting the server.
 
 ### `data/areas.toml`
 
@@ -809,7 +837,8 @@ Ferris-AO/
 │   ├── areas.toml          # Area definitions
 │   ├── characters.txt      # Character roster (one per line)
 │   ├── backgrounds.txt     # Allowed backgrounds
-│   └── music.txt           # Music list with category headers
+│   ├── music.txt           # Music list with category headers
+│   └── censor.txt          # Optional word censor list (one word/phrase per line)
 ├── nginx/
 │   └── nyahao.conf         # Example nginx reverse proxy config
 └── src/

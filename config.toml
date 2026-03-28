@@ -40,6 +40,12 @@ addr = "https://servers.aceattorneyonline.com/servers"
 # Optional: hostname or IP to advertise. Leave unset to let the master server detect it.
 # hostname = "your.domain.example"
 
+[censor]
+# When true, IC messages containing any word from data/censor.txt are silently
+# intercepted: the sender sees their message as sent, but it is not broadcast to others.
+# Has no effect if data/censor.txt is absent or contains no active words.
+enabled = false
+
 [rate_limits]
 # All per-client limits use a token bucket (rate = sustained tokens/sec, burst = max burst).
 # Packets that exceed the limit are silently dropped.

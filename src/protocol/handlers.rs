@@ -740,6 +740,22 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
         return;
     }
 
+    // Censor check: if enabled and the decoded message contains a censored word,
+    // treat it like a shadowmute — the sender sees it succeed, others don't get it.
+    if state.config.censor.enabled {
+        let msg_text = ao_decode(&args[4]);
+        let msg_lower = msg_text.to_lowercase();
+        let censored = {
+            let rdata = state.reloadable.read().await;
+            !rdata.censor_words.is_empty()
+                && rdata.censor_words.iter().any(|w| msg_lower.contains(w.as_str()))
+        };
+        if censored {
+            session.send_packet("MS", &arg_refs);
+            return;
+        }
+    }
+
     // Broadcast to area
     state.broadcast_to_area(session.area_idx, "MS", &arg_refs).await;
 }

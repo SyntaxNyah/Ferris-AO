@@ -1,0 +1,9 @@
+# Ferris-AO word censor list
+# One word or phrase per line. Blank lines and lines starting with # are ignored.
+# Matching is case-insensitive and checks for the word anywhere in the message.
+# Enable this filter in config.toml under [censor] with enabled = true.
+#
+# Example entries (all commented out by default):
+# badword
+# slur
+# spam phrase

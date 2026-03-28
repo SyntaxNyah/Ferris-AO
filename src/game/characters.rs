@@ -11,6 +11,22 @@ pub fn load_lines(path: &Path) -> Result<Vec<String>> {
     Ok(lines)
 }
 
+/// Load censor words from a file (one word per line).
+/// Lines that are blank or start with `#` are skipped.
+/// Words are lowercased so the runtime check is case-insensitive.
+/// Returns an empty Vec if the file does not exist.
+pub fn load_censor_words(path: &Path) -> Vec<String> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => content
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| l.to_lowercase())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Build the SM packet body: area names first, then music entries.
 /// Format: `SM#area1#area2#...#song1#song2#...#%`
 /// If music list doesn't start with a category (first entry has '.'), prepend "Songs".

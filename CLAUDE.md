@@ -26,7 +26,8 @@ Ferris-AO/
 │   ├── areas.toml          # Area definitions (TOML array of [[area]])
 │   ├── characters.txt      # One character folder name per line
 │   ├── backgrounds.txt     # One background name per line
-│   └── music.txt           # Music list; lines without '.' are category headers
+│   ├── music.txt           # Music list; lines without '.' are category headers
+│   └── censor.txt          # Optional; one word/phrase per line, # = comment
 ├── nginx/
 │   └── nyahao.conf         # Example nginx reverse proxy config
 └── src/
@@ -224,7 +225,7 @@ pub struct Packet {
 | `/watchlist add <hdid> [note]` | `WATCHLIST` | Add HDID to watchlist |
 | `/watchlist remove <hdid>` | `WATCHLIST` | Remove HDID from watchlist |
 | `/watchlist list` | `WATCHLIST` | List all watchlist entries |
-| `/reload` | `ADMIN` | Hot-reload characters/music/backgrounds into `ReloadableData` |
+| `/reload` | `ADMIN` | Hot-reload characters/music/backgrounds/censor words into `ReloadableData` |
 | `/logoutall` | `ADMIN` | Send `__LOGOUT__` to all authenticated sessions |
 
 ---
@@ -287,6 +288,9 @@ Config {
 - `reverse_proxy_mode` — when true, trust X-Forwarded-For / X-Real-IP; also enables PP2 on TCP
 - `reverse_proxy_http_port` (80), `reverse_proxy_https_port` (443)
 - `ws_ping_interval_secs` (30), `ws_ping_timeout_secs` (90)
+
+**CensorConfig** (entire section optional):
+- `enabled` (default: `false`) — when true, IC messages matching `censor_words` are silently intercepted
 
 **RateLimitsConfig** — all have defaults, entire section is optional:
 - IC: `ic_rate=3.0`, `ic_burst=5`
@@ -477,6 +481,60 @@ pub enum MuteState {
 `mute_until: Option<Instant>` — `None` = permanent, `Some(t)` = expires at `t`.
 
 ---
+
+## Censor System
+
+### Config (`config.rs`)
+
+```rust
+pub struct CensorConfig {
+    pub enabled: bool,  // default: false
+}
+```
+
+Added to `Config` as `pub censor: CensorConfig` with `#[serde(default)]`.
+
+### Word list (`game/characters.rs` — `load_censor_words`)
+
+```rust
+pub fn load_censor_words(path: &Path) -> Vec<String>
+```
+
+- Returns empty `Vec` if file doesn't exist (no error)
+- Skips blank lines and lines starting with `#`
+- Lowercases all words for efficient case-insensitive comparison at runtime
+- Used in `main.rs` at startup and in `cmd_reload` to hot-reload
+
+### Storage (`server.rs`)
+
+`ReloadableData.censor_words: Vec<String>` — the loaded, pre-lowercased word list.
+Hot-reloadable via `/reload` (ADMIN only).
+
+### Check (`protocol/handlers.rs` — `handle_ms`)
+
+Applied in `handle_ms` **after** the shadowmute check and **before** the area broadcast:
+
+```rust
+if state.config.censor.enabled {
+    let msg_text = ao_decode(&args[4]);   // decode the IC message text
+    let msg_lower = msg_text.to_lowercase();
+    let censored = {
+        let rdata = state.reloadable.read().await;
+        !rdata.censor_words.is_empty()
+            && rdata.censor_words.iter().any(|w| msg_lower.contains(w.as_str()))
+    };
+    if censored {
+        session.send_packet("MS", &arg_refs);  // sender thinks it went through
+        return;                                 // not broadcast to others
+    }
+}
+```
+
+**Matching:** case-insensitive substring — the word anywhere in the message triggers the intercept. Only applies to IC messages (MS packet). OOC/CT is not censored.
+
+**Behavior when a word matches:** identical to shadowmute — sender sees the echo of their own message, nobody else receives it.
+
+**Data file:** `data/censor.txt` — one word or phrase per line, `#` lines are comments.
 
 ## Rate Limiting (ratelimit.rs)
 

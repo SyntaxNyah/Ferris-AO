@@ -1160,13 +1160,18 @@ async fn cmd_reload(session: &mut ClientSession, state: &Arc<ServerState>) {
     let area_name_refs: Vec<&str> = area_names.iter().map(|s| s.as_str()).collect();
     let sm_packet = build_sm_packet(&area_name_refs, &music);
 
-    let counts = format!("{} chars, {} music, {} backgrounds", characters.len(), music.len(), backgrounds.len());
+    let censor_words = crate::game::characters::load_censor_words(std::path::Path::new("data/censor.txt"));
+    let counts = format!(
+        "{} chars, {} music, {} backgrounds, {} censor words",
+        characters.len(), music.len(), backgrounds.len(), censor_words.len()
+    );
     {
         let mut data = state.reloadable.write().await;
         data.characters = characters;
         data.music = music;
         data.backgrounds = backgrounds;
         data.sm_packet = sm_packet;
+        data.censor_words = censor_words;
     }
 
     session.server_message(&state.config.server.name, &format!("Reloaded: {}", counts));

@@ -12,6 +12,8 @@ pub struct Config {
     pub master_server: MasterServerConfig,
     #[serde(default)]
     pub rate_limits: RateLimitsConfig,
+    #[serde(default)]
+    pub censor: CensorConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,6 +156,23 @@ fn default_zz_cooldown() -> u64 { 60 }
 // 1 connection per second (60/min) — permissive enough for bad WiFi reconnects
 fn default_conn_rate() -> f64 { 1.0 }
 fn default_conn_burst() -> u32 { 5 }
+
+/// Word-censor configuration. When enabled, IC messages containing any word
+/// from `data/censor.txt` are silently intercepted: the sender sees their
+/// message as if it was sent, but it is not broadcast to others.
+#[derive(Debug, Deserialize)]
+pub struct CensorConfig {
+    /// Enable the censor filter. Default: false.
+    /// Has no effect if `data/censor.txt` is absent or empty.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl Default for CensorConfig {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
 
 impl Default for RateLimitsConfig {
     fn default() -> Self {

@@ -28,6 +28,8 @@ pub struct ReloadableData {
     pub backgrounds: Vec<String>,
     /// Pre-built SM packet string (sent to every joining client).
     pub sm_packet: String,
+    /// Words loaded from data/censor.txt (pre-lowercased). Empty = no filter.
+    pub censor_words: Vec<String>,
 }
 
 /// A handle to a connected client, stored in ServerState and readable by all tasks.
