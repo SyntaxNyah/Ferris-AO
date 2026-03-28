@@ -301,6 +301,7 @@ openssl rand -hex 32
 | `BANS_BY_HDID` | No | HDID → ban ID index for fast ban lookups |
 | `ACCOUNTS` | Yes | Moderator accounts keyed by username |
 | `WATCHLIST` | Yes | Watchlist entries keyed by hashed HDID |
+| `IPID_BANS` | Yes | IPID ban records keyed by hashed IPID |
 
 The database files (`nyahao.db`, `nyahao.db-shm`, `nyahao.db-wal`) are excluded from git via `.gitignore`.
 
@@ -455,13 +456,170 @@ While the server is running, the process reads commands from stdin:
 
 ## Reverse Proxy Setup
 
-Running Ferris-AO behind a reverse proxy is strongly recommended — it provides TLS termination, rate limiting, and DDoS protection (via Cloudflare). Set `reverse_proxy_mode = true` in `config.toml` for any proxy. The real client IP is recovered from `X-Forwarded-For` or `X-Real-IP`; Ferris-AO hashes it to an IPID immediately and never stores the raw address.
+Running Ferris-AO behind a reverse proxy is strongly recommended for TLS termination, DDoS protection (Cloudflare), and IP privacy. Set `reverse_proxy_mode = true` in `config.toml` for any proxy. The real client IP is recovered from `X-Forwarded-For` or `X-Real-IP`; Ferris-AO hashes it immediately and never stores the raw address.
 
 | Proxy | Logs IPs by default | TLS | WebSocket | Best for |
 |---|---|---|---|---|
+| **nginx** | Yes — disable with `access_log off` | certbot (Let's Encrypt) | Manual config | Production, Cloudflare, advanced tuning |
 | **Caddy** | No | Automatic (Let's Encrypt) | Automatic | Simple setups, bare metal |
 | **Traefik** | No | Automatic (Let's Encrypt) | Automatic | Docker / container deployments |
-| **nginx** | Yes — disable with `access_log off` | Manual (certbot) | Manual config | High-traffic, advanced tuning |
+
+---
+
+### nginx + Cloudflare (recommended production setup)
+
+This guide uses two domains as an example:
+
+| Domain | Cloudflare | Purpose |
+|---|---|---|
+| `hatsune.miku.pizza` | **Gray cloud** (DNS only) | Game connections (TCP + WSS). Must be direct — certbot needs port 80, TCP clients need port 27017. |
+| `miku.pizza` | **Orange cloud** (proxied) | Asset URL. Cloudflare CDN caches your asset bundle files. |
+
+#### 1. DNS setup in Cloudflare
+
+In your Cloudflare dashboard, add two A records pointing to your VPS IP:
+
+```
+Type  Name              Content       Proxy
+A     miku.pizza        <VPS IP>      Proxied (orange)
+A     hatsune.miku.pizza <VPS IP>     DNS only (gray)
+```
+
+**Why gray-cloud for the game subdomain?**
+- TCP clients connect directly to `hatsune.miku.pizza:27017` — Cloudflare cannot proxy raw TCP on the free tier
+- certbot's HTTP-01 challenge requires a direct connection to your VPS on port 80
+- WebSocket connections are more stable over a direct path
+
+#### 2. Install nginx and certbot on your VPS
+
+```bash
+sudo apt update
+sudo apt install nginx certbot python3-certbot-nginx
+```
+
+#### 3. Install the nginx config
+
+```bash
+# Copy the example config (adjust paths if you cloned elsewhere)
+sudo cp nginx/nyahao.conf /etc/nginx/sites-available/ferris-ao
+
+# Edit it — replace hatsune.miku.pizza with your actual subdomain
+sudo nano /etc/nginx/sites-available/ferris-ao
+
+# Symlink into sites-enabled
+sudo ln -s /etc/nginx/sites-available/ferris-ao /etc/nginx/sites-enabled/ferris-ao
+
+# Test the config
+sudo nginx -t
+
+# Apply
+sudo systemctl reload nginx
+```
+
+#### 4. Issue a TLS certificate
+
+```bash
+sudo certbot --nginx -d hatsune.miku.pizza
+```
+
+Certbot will automatically edit the nginx config to fill in the certificate paths and set up HTTPS. It also installs a cron job that auto-renews the certificate every 60 days.
+
+Verify renewal works:
+```bash
+sudo certbot renew --dry-run
+```
+
+#### 5. Open firewall ports
+
+```bash
+sudo ufw allow 27017/tcp   # TCP game clients (direct)
+sudo ufw allow 80/tcp      # HTTP (certbot renewal)
+sudo ufw allow 443/tcp     # HTTPS/WSS (WebSocket clients via nginx)
+sudo ufw enable
+```
+
+#### 6. Configure Ferris-AO
+
+```toml
+[server]
+# Asset URL uses the orange-clouded domain so Cloudflare CDN serves the files
+asset_url = "https://miku.pizza/assets"
+
+[network]
+bind_addr              = "0.0.0.0"   # TCP must be directly reachable
+tcp_port               = 27017       # Direct TCP — no nginx involved
+ws_port                = 27018       # nginx forwards hatsune.miku.pizza:443 → here
+reverse_proxy_mode     = true
+reverse_proxy_https_port = 443
+
+[master_server]
+advertise = true
+hostname  = "hatsune.miku.pizza"    # Advertised in the server list
+```
+
+The server will advertise:
+- **TCP:** `hatsune.miku.pizza:27017` (direct)
+- **WSS:** `wss://hatsune.miku.pizza:443` (via nginx → localhost:27018)
+
+#### How traffic flows
+
+```
+Player (AO2 desktop)
+  └─ TCP :27017 ──────────────────→ VPS :27017 → Ferris-AO (direct)
+
+Player (WebAO browser)
+  └─ wss://hatsune.miku.pizza:443
+       └─ gray DNS → VPS :443 → nginx → localhost:27018 → Ferris-AO
+
+Asset download
+  └─ https://miku.pizza/assets/...
+       └─ orange DNS → Cloudflare CDN → VPS (cached)
+```
+
+#### The nginx config file (`nginx/nyahao.conf`)
+
+```nginx
+# Redirect HTTP → HTTPS
+server {
+    listen 80;
+    server_name hatsune.miku.pizza;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# HTTPS + WebSocket proxy
+server {
+    listen 443 ssl;
+    server_name hatsune.miku.pizza;
+
+    ssl_certificate     /etc/letsencrypt/live/hatsune.miku.pizza/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/hatsune.miku.pizza/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    access_log off;   # Privacy — Ferris-AO never stores raw IPs either
+
+    location / {
+        proxy_pass         http://127.0.0.1:27018;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade    $http_upgrade;
+        proxy_set_header   Connection "upgrade";
+        proxy_set_header   Host       $host;
+        proxy_set_header   X-Real-IP       $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 7200s;
+        proxy_send_timeout 30s;
+        proxy_buffering    off;
+    }
+}
+```
+
+The full annotated config with TCP stream block and setup comments is at `nginx/nyahao.conf`.
 
 ---
 
@@ -693,6 +851,9 @@ Commands are entered in the OOC chat box prefixed with `/`.
 | `/unpair` | Cancel your current pairing |
 | `/pm <uid> <message>` | Send a private message to a player |
 | `/r <message>` | Reply to the last player who sent you a private message |
+| `/ignore <uid>` | Hide IC and OOC messages from a player (session only — resets on disconnect) |
+| `/unignore <uid>` | Stop ignoring a player |
+| `/ignorelist` | Show which UIDs you are currently ignoring |
 
 ### Moderator Commands
 
@@ -710,6 +871,8 @@ These commands require specific permissions (see [Permission System](#permission
 | `/warn <uid> <reason>` | `KICK` | Increment a player's warning count and notify them. |
 | `/announce <message>` | `MOD_CHAT` | Send a server-wide OOC announcement to all players. |
 | `/modchat <message>` | `MOD_CHAT` | Send a message only visible to authenticated moderators. |
+| `/ipban <uid> [duration] <reason>` | `KICK` | Ban a player by their current IPID. Duration: `1h`, `6h`, `12h`, `1d`, `7d`; omit for permanent (until daily IPID rotation). |
+| `/unipban <ipid>` | `BAN` | Remove an IPID ban. |
 | `/watchlist add <hdid> [note]` | `WATCHLIST` | Add a hashed HDID to the watchlist with an optional note. |
 | `/watchlist remove <hdid>` | `WATCHLIST` | Remove a hashed HDID from the watchlist. |
 | `/watchlist list` | `WATCHLIST` | List all watchlist entries with who added them and when. |

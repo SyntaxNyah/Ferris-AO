@@ -173,6 +173,20 @@ async fn handle_hi(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
         Ok(None) => {}
     }
 
+    // Check IPID ban
+    match state.ipid_bans.is_banned(&session.ipid) {
+        Ok(Some(ban)) => {
+            session.send_packet("BD", &[&format!(
+                "{}\nUntil: {}\n(IPID ban — resets at midnight UTC)",
+                ban.reason,
+                ban.duration_display(),
+            )]);
+            return;
+        }
+        Err(e) => warn!("IPID ban check error for IPID {}: {}", session.ipid, e),
+        Ok(None) => {}
+    }
+
     // Check watchlist — notify all online authenticated mods if this HDID is flagged.
     match state.watchlist.get(&hashed_hdid) {
         Ok(Some(entry)) => {
@@ -323,6 +337,7 @@ async fn handle_rd(session: &mut ClientSession, state: &Arc<ServerState>) {
         force_pair_uid: None,
         pair_info: Default::default(),
         pos: String::new(),
+        ignored_uids: std::collections::HashSet::new(),
     });
     state.add_client(handle).await;
 
@@ -756,8 +771,9 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
         }
     }
 
-    // Broadcast to area
-    state.broadcast_to_area(session.area_idx, "MS", &arg_refs).await;
+    // Broadcast to area, skipping receivers who have ignored the sender.
+    let sender_uid = session.uid.unwrap_or(u32::MAX);
+    state.broadcast_to_area_from(session.area_idx, sender_uid, "MS", &arg_refs).await;
 }
 
 /// MC#song_or_area#char_id#...%
@@ -911,7 +927,8 @@ async fn handle_ct(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
         return;
     }
 
-    state.broadcast_to_area(session.area_idx, "CT", &[&encoded_name, message, "0"]).await;
+    let sender_uid = session.uid.unwrap_or(u32::MAX);
+    state.broadcast_to_area_from(session.area_idx, sender_uid, "CT", &[&encoded_name, message, "0"]).await;
 }
 
 /// PE#name#description#image%

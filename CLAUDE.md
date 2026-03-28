@@ -106,6 +106,7 @@ pub struct ServerState {
     pub db: Arc<EncryptedDb>,                      // Persistent storage
     pub accounts: AccountManager,
     pub bans: BanManager,
+    pub ipid_bans: IpidBanManager,
     pub watchlist: WatchlistManager,
     pub player_watch_tx: watch::Sender<usize>,     // Triggers master server re-advertise
     pub conn_limiters: Mutex<HashMap<IpAddr, TokenBucket>>, // Per-IP connection rate
@@ -222,6 +223,11 @@ pub struct Packet {
 | `/baninfo <hdid>` | `BAN_INFO` | Fetch active ban for HDID |
 | `/announce <msg>` | `MOD_CHAT` | Server-wide CT broadcast |
 | `/modchat <msg>` | `MOD_CHAT` | CT message to authenticated mods only |
+| `/ipban <uid> [dur] <reason>` | `KICK` | Ban by target's current IPID (daily-rotating); duration: `1h`/`6h`/`12h`/`1d`/`7d` or permanent |
+| `/unipban <ipid>` | `BAN` | Remove an IPID ban |
+| `/ignore <uid>` | — | Hide IC+OOC from a player (session-only, resets on disconnect); stored in `ClientHandle.ignored_uids` |
+| `/unignore <uid>` | — | Stop ignoring a player |
+| `/ignorelist` | — | Show your current ignore list |
 | `/watchlist add <hdid> [note]` | `WATCHLIST` | Add HDID to watchlist |
 | `/watchlist remove <hdid>` | `WATCHLIST` | Remove HDID from watchlist |
 | `/watchlist list` | `WATCHLIST` | List all watchlist entries |
@@ -390,6 +396,7 @@ Wraps [redb](https://github.com/cberner/redb) (embedded MVCC key-value). Encrypt
 | `BANS_BY_HDID_TABLE` | `&str` | No | HDID → `Vec<u64>` ban ID index |
 | `ACCOUNTS_TABLE` | `&str` | Yes | Moderator accounts |
 | `WATCHLIST_TABLE` | `&str` | Yes | Watch entries keyed by hashed HDID |
+| `IPID_BANS_TABLE` | `&str` | Yes | IPID ban records keyed by hashed IPID |
 
 **Important:** When iterating `redb` tables you must import `use redb::ReadableTable` for `.iter()` to be in scope.
 
@@ -618,12 +625,14 @@ if let Some(handle) = clients.get(&target_uid) {
 ### Sending to all clients in an area
 
 ```rust
-let clients = state.clients.lock().unwrap();
-for handle in clients.values() {
-    if handle.area_idx == area_idx {
-        let _ = handle.tx.send(packet_string.clone());
-    }
-}
+// For IC (MS) and OOC (CT) — respects ignore lists
+state.broadcast_to_area_from(area_idx, sender_uid, "MS", &arg_refs).await;
+
+// For system messages (HP, BN, LE, etc.) — ignores are not applied
+state.broadcast_to_area(area_idx, "BN", &[&bg]).await;
+```
+
+`broadcast_to_area_from` skips any receiver whose `ClientHandle.ignored_uids` contains `sender_uid`.
 ```
 
 ### Sending to all authenticated mods

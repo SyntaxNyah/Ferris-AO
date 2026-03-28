@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use chrono::Utc;
+
 use crate::{
     auth::accounts::perms,
     client::ClientSession,
@@ -51,6 +53,11 @@ pub async fn dispatch_command(
         "motd" => cmd_motd(session, state),
         "clear" => cmd_clear(session, state).await,
         "watchlist" => cmd_watchlist(session, state, args).await,
+        "ipban" => cmd_ipban(session, state, args).await,
+        "unipban" => cmd_unipban(session, state, args).await,
+        "ignore" => cmd_ignore(session, state, args).await,
+        "unignore" => cmd_unignore(session, state, args).await,
+        "ignorelist" => cmd_ignorelist(session, state).await,
         "pm" => cmd_pm(session, state, args).await,
         "r" => cmd_r(session, state, args).await,
         "reload" => cmd_reload(session, state).await,
@@ -68,10 +75,12 @@ Commands:
 /cm [uid] /uncm [uid] /bg <bg> /status <status> /lock [-s] /unlock /play <song>
 /pair <uid> /unpair /narrator /login <user> <pass> /logout /mod <msg>
 /pm <uid> <msg>  — private message  |  /r <msg>  — reply to last PM
+/ignore <uid>  /unignore <uid>  /ignorelist
 /motd /clear
 [MOD] /kick <uid> /mute <uid> [ic|ooc|all] /unmute <uid> /shadowmute <uid>
 [MOD] /warn <uid> <reason>
 [MOD] /ban <uid> <reason> /unban <ban_id> /baninfo <hdid_hash> /announce <msg> /modchat <msg>
+[MOD] /ipban <uid> [duration] <reason>  /unipban <ipid>
 [MOD] /watchlist add <hdid> [note] | /watchlist remove <hdid> | /watchlist list
 [ADMIN] /reload  — hot-reload characters/music/backgrounds
 [ADMIN] /logoutall  — force-logout all authenticated sessions";
@@ -1125,6 +1134,192 @@ async fn cmd_shadowmute(session: &mut ClientSession, state: &Arc<ServerState>, a
         session.server_message(&state.config.server.name, &format!("Shadowmuted UID {}.", target_uid));
     } else {
         session.server_message(&state.config.server.name, "Client not found.");
+    }
+}
+
+/// /ipban <uid> [duration] <reason> — ban a player by their current IPID (MOD only).
+/// Duration format: 1h, 6h, 12h, 1d, 7d — omit for a permanent ban (until daily rotation).
+async fn cmd_ipban(session: &mut ClientSession, state: &Arc<ServerState>, args: Vec<String>) {
+    if !perms::has(session.permissions, perms::KICK) {
+        session.server_message(&state.config.server.name, "No permission.");
+        return;
+    }
+    if args.is_empty() {
+        session.server_message(&state.config.server.name, "Usage: /ipban <uid> [duration] <reason>");
+        return;
+    }
+    let sname = state.config.server.name.clone();
+    let target_uid: u32 = match args[0].parse() {
+        Ok(n) => n,
+        Err(_) => { session.server_message(&sname, "Invalid UID."); return; }
+    };
+
+    // Get target's IPID and name from shared handle
+    let (target_ipid, target_char) = {
+        let clients = state.clients.lock().await;
+        match clients.get(&target_uid) {
+            Some(h) => {
+                let char_name = h.char_id
+                    .and_then(|id| {
+                        // We can't await here so just use the raw char_id as string fallback
+                        Some(format!("UID {}", h.uid))
+                    })
+                    .unwrap_or_else(|| format!("UID {}", h.uid));
+                (h.ipid.clone(), char_name)
+            }
+            None => { session.server_message(&sname, "Player not found."); return; }
+        }
+    };
+
+    // Parse optional duration and reason
+    let (expires_at, reason) = if args.len() >= 2 {
+        let maybe_dur = &args[1];
+        let dur_secs: Option<i64> = if maybe_dur.ends_with('h') {
+            maybe_dur[..maybe_dur.len()-1].parse::<i64>().ok().map(|h| h * 3600)
+        } else if maybe_dur.ends_with('d') {
+            maybe_dur[..maybe_dur.len()-1].parse::<i64>().ok().map(|d| d * 86400)
+        } else {
+            None
+        };
+        if let Some(secs) = dur_secs {
+            let exp = Utc::now().timestamp() + secs;
+            let reason = args[2..].join(" ");
+            if reason.is_empty() {
+                session.server_message(&sname, "Please provide a reason after the duration.");
+                return;
+            }
+            (Some(exp), reason)
+        } else {
+            (None, args[1..].join(" "))
+        }
+    } else {
+        session.server_message(&sname, "Usage: /ipban <uid> [duration] <reason>");
+        return;
+    };
+
+    if reason.is_empty() {
+        session.server_message(&sname, "Please provide a ban reason.");
+        return;
+    }
+
+    let moderator = session.mod_name.clone().unwrap_or_else(|| "unknown".into());
+    match state.ipid_bans.add(&target_ipid, expires_at, &reason, &moderator) {
+        Ok(()) => {
+            session.server_message(&sname, &format!(
+                "IPID-banned {} (IPID: {}…). Reason: {}",
+                target_char,
+                &target_ipid[..target_ipid.len().min(8)],
+                reason
+            ));
+            // Kick the target
+            let clients = state.clients.lock().await;
+            if let Some(h) = clients.get(&target_uid) {
+                h.send_packet("BD", &[&format!("{}\n(IPID ban)", reason)]);
+            }
+        }
+        Err(e) => session.server_message(&sname, &format!("DB error: {}", e)),
+    }
+}
+
+/// /unipban <ipid> — remove an IPID ban (MOD only).
+async fn cmd_unipban(session: &mut ClientSession, state: &Arc<ServerState>, args: Vec<String>) {
+    if !perms::has(session.permissions, perms::BAN) {
+        session.server_message(&state.config.server.name, "No permission. BAN required.");
+        return;
+    }
+    let sname = state.config.server.name.clone();
+    if args.is_empty() {
+        session.server_message(&sname, "Usage: /unipban <ipid>");
+        return;
+    }
+    let ipid = &args[0];
+    match state.ipid_bans.remove(ipid) {
+        Ok(true) => session.server_message(&sname, &format!("Removed IPID ban for {}.", ipid)),
+        Ok(false) => session.server_message(&sname, "No IPID ban found for that value."),
+        Err(e) => session.server_message(&sname, &format!("DB error: {}", e)),
+    }
+}
+
+/// /ignore <uid> — hide IC and OOC messages from a player (session only, resets on disconnect).
+async fn cmd_ignore(session: &mut ClientSession, state: &Arc<ServerState>, args: Vec<String>) {
+    let sname = state.config.server.name.clone();
+    if args.is_empty() {
+        session.server_message(&sname, "Usage: /ignore <uid>");
+        return;
+    }
+    let target_uid: u32 = match args[0].parse() {
+        Ok(n) => n,
+        Err(_) => { session.server_message(&sname, "Invalid UID."); return; }
+    };
+    let my_uid = match session.uid {
+        Some(u) => u,
+        None => return,
+    };
+    if target_uid == my_uid {
+        session.server_message(&sname, "You cannot ignore yourself.");
+        return;
+    }
+    // Check they exist and get display name
+    let exists = {
+        let clients = state.clients.lock().await;
+        clients.contains_key(&target_uid)
+    };
+    if !exists {
+        session.server_message(&sname, "Player not found.");
+        return;
+    }
+    // Update our ClientHandle
+    {
+        let mut clients = state.clients.lock().await;
+        if let Some(h) = clients.get_mut(&my_uid) {
+            Arc::make_mut(h).ignored_uids.insert(target_uid);
+        }
+    }
+    session.server_message(&sname, &format!("You are now ignoring UID {}.", target_uid));
+}
+
+/// /unignore <uid> — stop ignoring a player.
+async fn cmd_unignore(session: &mut ClientSession, state: &Arc<ServerState>, args: Vec<String>) {
+    let sname = state.config.server.name.clone();
+    if args.is_empty() {
+        session.server_message(&sname, "Usage: /unignore <uid>");
+        return;
+    }
+    let target_uid: u32 = match args[0].parse() {
+        Ok(n) => n,
+        Err(_) => { session.server_message(&sname, "Invalid UID."); return; }
+    };
+    let my_uid = match session.uid {
+        Some(u) => u,
+        None => return,
+    };
+    {
+        let mut clients = state.clients.lock().await;
+        if let Some(h) = clients.get_mut(&my_uid) {
+            Arc::make_mut(h).ignored_uids.remove(&target_uid);
+        }
+    }
+    session.server_message(&sname, &format!("You are no longer ignoring UID {}.", target_uid));
+}
+
+/// /ignorelist — show all UIDs you are currently ignoring.
+async fn cmd_ignorelist(session: &mut ClientSession, state: &Arc<ServerState>) {
+    let sname = state.config.server.name.clone();
+    let my_uid = match session.uid {
+        Some(u) => u,
+        None => return,
+    };
+    let ignored: Vec<u32> = {
+        let clients = state.clients.lock().await;
+        clients.get(&my_uid)
+            .map(|h| h.ignored_uids.iter().copied().collect())
+            .unwrap_or_default()
+    };
+    if ignored.is_empty() {
+        session.server_message(&sname, "You are not ignoring anyone.");
+    } else {
+        let list: Vec<String> = ignored.iter().map(|u| u.to_string()).collect();
+        session.server_message(&sname, &format!("Ignored UIDs: {}", list.join(", ")));
     }
 }
 

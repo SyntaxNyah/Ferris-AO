@@ -11,6 +11,7 @@ pub const BANS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("bans")
 pub const BANS_BY_HDID_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("bans_by_hdid");
 pub const ACCOUNTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("accounts");
 pub const WATCHLIST_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("watchlist");
+pub const IPID_BANS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("ipid_bans");
 
 pub struct EncryptedDb {
     pub inner: Database,
@@ -31,6 +32,7 @@ impl EncryptedDb {
             write_txn.open_table(BANS_BY_HDID_TABLE)?;
             write_txn.open_table(ACCOUNTS_TABLE)?;
             write_txn.open_table(WATCHLIST_TABLE)?;
+            write_txn.open_table(IPID_BANS_TABLE)?;
         }
         write_txn.commit()?;
 
@@ -202,5 +204,37 @@ impl EncryptedDb {
             entries.push(entry);
         }
         Ok(entries)
+    }
+
+    /// Write an encrypted IPID ban record (key = hashed IPID).
+    pub fn ipid_bans_insert(&self, ipid: &str, value: &[u8]) -> Result<()> {
+        let encrypted = self.encrypt(value)?;
+        let write = self.inner.begin_write()?;
+        {
+            let mut table = write.open_table(IPID_BANS_TABLE)?;
+            table.insert(ipid, encrypted.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    pub fn ipid_bans_get(&self, ipid: &str) -> Result<Option<Vec<u8>>> {
+        let read = self.inner.begin_read()?;
+        let table = read.open_table(IPID_BANS_TABLE)?;
+        match table.get(ipid)? {
+            Some(v) => Ok(Some(self.decrypt(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn ipid_bans_remove(&self, ipid: &str) -> Result<bool> {
+        let write = self.inner.begin_write()?;
+        let removed;
+        {
+            let mut table = write.open_table(IPID_BANS_TABLE)?;
+            removed = table.remove(ipid)?.is_some();
+        }
+        write.commit()?;
+        Ok(removed)
     }
 }

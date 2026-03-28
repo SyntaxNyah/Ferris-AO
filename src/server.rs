@@ -8,12 +8,14 @@ use std::sync::{
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use std::collections::HashMap;
 
+use std::collections::HashSet;
+
 use crate::{
     auth::AccountManager,
     client::PairInfo,
     config::Config,
     game::areas::Area,
-    moderation::{BanManager, WatchlistManager},
+    moderation::{BanManager, IpidBanManager, WatchlistManager},
     privacy::PrivacyLayer,
     ratelimit::TokenBucket,
     storage::EncryptedDb,
@@ -47,6 +49,8 @@ pub struct ClientHandle {
     pub force_pair_uid: Option<u32>,
     pub pair_info: PairInfo,
     pub pos: String,
+    /// UIDs this client has /ignored — their IC and OOC messages are not delivered here.
+    pub ignored_uids: HashSet<u32>,
 }
 
 impl ClientHandle {
@@ -86,6 +90,7 @@ pub struct ServerState {
     pub db: Arc<EncryptedDb>,
     pub accounts: AccountManager,
     pub bans: BanManager,
+    pub ipid_bans: IpidBanManager,
     pub watchlist: WatchlistManager,
 
     /// Notifies the master server task whenever the player count changes.
@@ -108,6 +113,7 @@ impl ServerState {
         let max = config.server.max_players;
         let accounts = AccountManager::new(Arc::clone(&db));
         let bans = BanManager::new(Arc::clone(&db));
+        let ipid_bans = IpidBanManager::new(Arc::clone(&db));
         let watchlist = WatchlistManager::new(Arc::clone(&db));
 
         // Initialize UID pool with all available UIDs
@@ -127,6 +133,7 @@ impl ServerState {
             db,
             accounts,
             bans,
+            ipid_bans,
             watchlist,
             player_watch_tx,
             conn_limiters: Mutex::new(HashMap::new()),
@@ -202,6 +209,18 @@ impl ServerState {
         let clients = self.clients.lock().await;
         for handle in clients.values() {
             if handle.area_idx == area_idx {
+                handle.send(&msg);
+            }
+        }
+    }
+
+    /// Send a packet to all clients in an area, skipping any receiver who has
+    /// `sender_uid` in their ignore list (used for IC and OOC messages).
+    pub async fn broadcast_to_area_from(&self, area_idx: usize, sender_uid: u32, header: &str, args: &[&str]) {
+        let msg = Self::format_packet(header, args);
+        let clients = self.clients.lock().await;
+        for handle in clients.values() {
+            if handle.area_idx == area_idx && !handle.ignored_uids.contains(&sender_uid) {
                 handle.send(&msg);
             }
         }
