@@ -427,7 +427,33 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
     // Server: [17]=OTHER_NAME(new), [18]=OTHER_EMOTE(new), [19]=SELF_OFFSET,
     //         [20]=OTHER_OFFSET(new), [21]=OTHER_FLIP, [22]=IMMEDIATE, [23]=LOOPING_SFX,
     //         [24]=SCREENSHAKE, [25-27]=FRAME_*, [28]=ADDITIVE
-    let mut args: Vec<String> = Vec::with_capacity(29);
+    // Build 30-element server broadcast args.
+    // Client fields [0..=16] are forwarded unchanged.
+    // Server inserts OTHER_NAME [17], OTHER_EMOTE [18], OTHER_OFFSET [20], OTHER_FLIP [21]
+    // (filled by pairing logic below).  All remaining client fields shift up by the number
+    // of server-inserted fields that precede them.
+    //
+    //  Server idx  ← Client idx  Field
+    //  [0..=16]    ← [0..=16]    deskmod … other_charid (incl. showname at [15])
+    //  [17]        (server)      OTHER_NAME
+    //  [18]        (server)      OTHER_EMOTE
+    //  [19]        ← [17]        SELF_OFFSET
+    //  [20]        (server)      OTHER_OFFSET
+    //  [21]        (server)      OTHER_FLIP
+    //  [22]        ← [18]        IMMEDIATE (noninterrupting_preanim)
+    //  [23]        ← [19]        LOOPING_SFX
+    //  [24]        ← [20]        SCREENSHAKE
+    //  [25]        ← [21]        FRAME_SCREENSHAKE
+    //  [26]        ← [22]        FRAME_REALIZATION
+    //  [27]        ← [23]        FRAME_SFX
+    //  [28]        ← [24]        ADDITIVE
+    //  [29]        ← [25]        EFFECTS
+    //
+    // WebAO's handleMS receives f_contents = ["MS", arg0, …, arg29] (31 elements).
+    // It checks args.length > 29 (31 > 29 = true) and reads args[29]=ADDITIVE,
+    // args[30]=EFFECTS.  Without EFFECTS at [29], f_contents.length was 30 and
+    // args[30] was undefined, crashing the handler and silencing all IC messages.
+    let mut args: Vec<String> = Vec::with_capacity(30);
     for i in 0..17 {
         args.push(client_args[i].to_string());
     }
@@ -455,6 +481,11 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
     args.push(client_args[23].to_string());
     // [28] ADDITIVE - was client [24]
     args.push(client_args[24].to_string());
+    // [29] EFFECTS - was client [25]
+    // WebAO reads this at f_contents[30] (= args[29] in the 0-based body).
+    // Omitting it caused f_contents.length == 30, args.length > 29 evaluated true,
+    // and args[30] was undefined — crashing handleMS for every received IC message.
+    args.push(client_args[25].to_string());
 
     // Validate emote_mod
     let emote_mod: i32 = match args[7].parse() {
