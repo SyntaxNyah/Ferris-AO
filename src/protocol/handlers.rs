@@ -548,6 +548,7 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
     if args[22].is_empty() { args[22] = "0".into(); }
     if args[23].is_empty() { args[23] = "0".into(); }
     if args[24].is_empty() { args[24] = "0".into(); }
+    if args[28].is_empty() { args[28] = "0".into(); }
 
     // Validate boolean fields
     for idx in [12, 13, 22, 23, 24, 28] {
