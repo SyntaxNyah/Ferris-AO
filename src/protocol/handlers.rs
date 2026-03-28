@@ -399,12 +399,15 @@ async fn handle_cc(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
 /// MS#desk_mod#pre_anim#char_name#anim#msg#side#sfx_name#emote_mod#char_id#sfx_delay#
 ///    objection_mod#evidence#flip#realization#text_color#showname#other_charid#self_offset#immediate#...%
 async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &Packet) {
+    debug!("MS recv uid={:?} char_id={:?} fields={}", session.uid, session.char_id, pkt.body.len());
     if !session.rl_ic.try_consume() {
+        debug!("MS drop: rate limited");
         return;
     }
     let shadowmuted = session.is_shadowmuted();
     if !session.can_speak_ic() {
         session.server_message(&state.config.server.name, "You are not allowed to speak in this area.");
+        debug!("MS drop: can_speak_ic false (char_id={:?} mute={:?})", session.char_id, session.mute_state);
         return;
     }
 
@@ -456,7 +459,7 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
     // Validate emote_mod
     let emote_mod: i32 = match args[7].parse() {
         Ok(n) => n,
-        Err(_) => return,
+        Err(_) => { debug!("MS drop: emote_mod parse fail {:?}", args[7]); return; }
     };
     let emote_mod = if emote_mod == 4 {
         args[7] = "6".into();
@@ -465,6 +468,7 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
         emote_mod
     };
     if emote_mod < 0 || emote_mod > 6 {
+        debug!("MS drop: emote_mod out of range {}", emote_mod);
         return;
     }
 
@@ -472,20 +476,22 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
     let objection_str = args[10].split('&').next().unwrap_or("0");
     let objection: i32 = match objection_str.parse() {
         Ok(n) => n,
-        Err(_) => return,
+        Err(_) => { debug!("MS drop: objection parse fail {:?}", args[10]); return; }
     };
     if objection < 0 || objection > 4 {
+        debug!("MS drop: objection out of range {}", objection);
         return;
     }
 
     // Validate evidence
     let evi: usize = match args[11].parse() {
         Ok(n) => n,
-        Err(_) => return,
+        Err(_) => { debug!("MS drop: evidence parse fail {:?}", args[11]); return; }
     };
     {
         let area = state.areas[session.area_idx].read().await;
         if evi > area.evidence.len() {
+            debug!("MS drop: evidence idx {} > len {}", evi, area.evidence.len());
             return;
         }
     }
@@ -493,15 +499,17 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
     // Validate text_color
     let text_color: i32 = match args[14].parse() {
         Ok(n) => n,
-        Err(_) => return,
+        Err(_) => { debug!("MS drop: text_color parse fail {:?}", args[14]); return; }
     };
     if text_color < 0 || text_color > 11 {
+        debug!("MS drop: text_color out of range {}", text_color);
         return;
     }
 
     // Validate char_id
     let char_id_str = session.char_id.map(|id| id.to_string()).unwrap_or_default();
     if args[8] != char_id_str {
+        debug!("MS drop: char_id mismatch pkt={:?} session={:?}", args[8], char_id_str);
         return;
     }
 
@@ -513,6 +521,7 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
 
     // Duplicate message check
     if args[4] == session.last_msg {
+        debug!("MS drop: duplicate message");
         return;
     }
 
@@ -552,9 +561,9 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
 
     // Validate boolean fields
     for idx in [12, 13, 22, 23, 24, 28] {
-        if args.get(idx).map(|s| s.as_str()).unwrap_or("0") != "0"
-            && args.get(idx).map(|s| s.as_str()).unwrap_or("0") != "1"
-        {
+        let v = args.get(idx).map(|s| s.as_str()).unwrap_or("0");
+        if v != "0" && v != "1" {
+            debug!("MS drop: boolean field[{}]={:?}", idx, v);
             return;
         }
     }
@@ -592,9 +601,10 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
         for off in &offsets {
             let n: i32 = match off.parse() {
                 Ok(v) => v,
-                Err(_) => return,
+                Err(_) => { debug!("MS drop: self_offset parse fail {:?}", args[19]); return; }
             };
             if n < -100 || n > 100 {
+                debug!("MS drop: self_offset out of range {}", n);
                 return;
             }
         }
@@ -775,6 +785,7 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
 
     // Broadcast to area, skipping receivers who have ignored the sender.
     let sender_uid = session.uid.unwrap_or(u32::MAX);
+    debug!("MS broadcast uid={} area={} msg={:?}", sender_uid, session.area_idx, args[4]);
     state.broadcast_to_area_from(session.area_idx, sender_uid, "MS", &arg_refs).await;
 }
 
