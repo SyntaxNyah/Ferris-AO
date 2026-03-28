@@ -496,7 +496,7 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
         Ok(n) => n,
         Err(_) => return,
     };
-    if text_color < 0 || text_color > 6 {
+    if text_color < 0 || text_color > 11 {
         return;
     }
 
@@ -544,6 +544,8 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
     }
 
     // Default empty booleans
+    if args[12].is_empty() { args[12] = "0".into(); }
+    if args[13].is_empty() { args[13] = "0".into(); }
     if args[22].is_empty() { args[22] = "0".into(); }
     if args[23].is_empty() { args[23] = "0".into(); }
     if args[24].is_empty() { args[24] = "0".into(); }
@@ -692,7 +694,7 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
             args[20] = poffset;
             args[21] = pflip;
         } else {
-            args[16] = "-1^".to_string();
+            args[16] = "-1".to_string();
             args[17].clear();
             args[18].clear();
         }
