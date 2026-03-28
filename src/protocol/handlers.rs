@@ -595,10 +595,10 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
         }
     }
 
-    // Validate self_offset
+    // Validate self_offset (field is AO-encoded; "&" separating x and y is encoded as "<and>")
     if !args[19].is_empty() {
-        let offsets: Vec<&str> = args[19].split('&').collect();
-        for off in &offsets {
+        let decoded = ao_decode(&args[19]);
+        for off in decoded.split('&') {
             let n: i32 = match off.parse() {
                 Ok(v) => v,
                 Err(_) => { debug!("MS drop: self_offset parse fail {:?}", args[19]); return; }
