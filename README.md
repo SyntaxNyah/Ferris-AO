@@ -1,6 +1,6 @@
 # Ferris-AO
 
-A privacy-first [Attorney Online 2](https://attorneyonline.de/) server written in Rust.
+A privacy-first [Attorney Online 2](https://aceattorneyonline.com/) server written in Rust.
 
 Built with async-first design using Tokio, Ferris-AO implements the full AO2 protocol over both TCP and WebSocket transports, with a strong emphasis on user privacy — raw IP addresses and hardware IDs are never stored.
 
