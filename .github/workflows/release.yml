@@ -48,3 +48,33 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ matrix.artifact }}
+          body: |
+            ## Ferris-AO ${{ github.ref_name }}
+
+            A privacy-first AO2 server supporting both **AO2 desktop clients** and **[WebAO](https://github.com/AttorneyOnlineVidya/webAO)** browser clients simultaneously.
+
+            ### Features
+            - Full WebAO support — browser and desktop clients share areas and see each other's IC messages in real time
+            - Dual TCP + WebSocket transport
+            - Full AO2 protocol (IC, music, evidence, pairing, health points, rebuttals, case alerts)
+            - Privacy-by-design — IPs and HDIDs are hashed immediately and never stored
+            - AES-256-GCM encrypted database, Argon2id passwords
+            - Role-based moderation (kick, ban, mute, shadowmute, watchlist)
+            - PROXY Protocol v2 + Cloudflare / nginx reverse proxy support
+
+            ### Downloads
+            | File | Platform |
+            |------|----------|
+            | `nyahao-linux-x86_64` | Linux x86_64 |
+            | `nyahao-windows-x86_64.exe` | Windows x86_64 |
+
+            ### Quick start
+            ```bash
+            # Linux
+            chmod +x nyahao-linux-x86_64
+            ./nyahao-linux-x86_64
+
+            # Windows
+            nyahao-windows-x86_64.exe
+            ```
+            See the [README](https://github.com/${{ github.repository }}/blob/main/README.md) for full setup instructions.

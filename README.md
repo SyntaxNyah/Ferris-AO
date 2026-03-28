@@ -4,6 +4,8 @@ A privacy-first [Attorney Online 2](https://attorneyonline.de/) server written i
 
 Built with async-first design using Tokio, Ferris-AO implements the full AO2 protocol over both TCP and WebSocket transports, with a strong emphasis on user privacy — raw IP addresses and hardware IDs are never stored.
 
+Supports both **AO2 desktop clients** and **[WebAO](https://github.com/AttorneyOnlineVidya/webAO)** browser clients simultaneously — they share the same areas and can communicate with each other in real time.
+
 ---
 
 ## Table of Contents
@@ -43,7 +45,8 @@ Ferris-AO is a server backend for the AO2 protocol. It manages areas (rooms), ch
 
 ## Features
 
-- **Dual transport** — Accepts both legacy TCP (AO2 protocol) and WebSocket connections simultaneously
+- **Dual transport** — Accepts both legacy TCP (AO2 desktop) and WebSocket (WebAO browser client) connections simultaneously
+- **WebAO support** — Full interoperability with [WebAO](https://github.com/AttorneyOnlineVidya/webAO): browser and desktop clients share areas, see each other's IC messages, and interact in real time
 - **Full AO2 protocol** — Supports all standard packets including IC messages, music changes, evidence, health points, rebuttals, case alerts, and pairing
 - **Privacy-by-design** — IPs hashed to daily-rotating IPIDs; HDIDs permanently hashed; nothing sensitive is ever logged
 - **Encrypted database** — All ban and account records are stored with AES-256-GCM encryption via an embedded [redb](https://github.com/cberner/redb) database
