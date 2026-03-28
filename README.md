@@ -4,7 +4,7 @@ A privacy-first [Attorney Online 2](https://aceattorneyonline.com/) server writt
 
 Built with async-first design using Tokio, Ferris-AO implements the full AO2 protocol over both TCP and WebSocket transports, with a strong emphasis on user privacy — raw IP addresses and hardware IDs are never stored.
 
-Supports both **AO2 desktop clients** and **[WebAO](https://github.com/AttorneyOnline/webAO)** browser clients simultaneously — they share the same areas and can communicate with each other in real time.
+Supports both **AO2 desktop clients** and **(https://github.com/AttorneyOnline/webAO)** browser clients simultaneously — they share the same areas and can communicate with each other in real time.
 
 ---
 
