@@ -60,6 +60,8 @@ pub async fn dispatch_command(
         "ignorelist" => cmd_ignorelist(session, state).await,
         "pm" => cmd_pm(session, state, args).await,
         "r" => cmd_r(session, state, args).await,
+        "roll" | "dice" => cmd_roll(session, state, args).await,
+        "flip" => cmd_flip(session, state).await,
         "reload" => cmd_reload(session, state).await,
         "logoutall" => cmd_logoutall(session, state).await,
         _ => {
@@ -72,7 +74,9 @@ fn cmd_help(session: &mut ClientSession, state: &Arc<ServerState>) {
     let msg = "\
 Commands:
 /help /about /who /move <area> /charselect /doc [text] /areainfo
-/cm [uid] /uncm [uid] /bg <bg> /status <status> /lock [-s] /unlock /play <song>
+/cm [uid] /uncm [uid] /bg <bg> /status <status> /lock [-s] /unlock
+/play <song or URL>  — CMs and DJs only; URLs stream audio (http/https)
+/roll [NdM]  — roll dice, e.g. /roll 2d6 or /roll d20  |  /flip  — coin flip
 /pair <uid> /unpair /narrator /login <user> <pass> /logout /mod <msg>
 /pm <uid> <msg>  — private message  |  /r <msg>  — reply to last PM
 /ignore <uid>  /unignore <uid>  /ignorelist
@@ -1320,6 +1324,70 @@ async fn cmd_ignorelist(session: &mut ClientSession, state: &Arc<ServerState>) {
         let list: Vec<String> = ignored.iter().map(|u| u.to_string()).collect();
         session.server_message(&sname, &format!("Ignored UIDs: {}", list.join(", ")));
     }
+}
+
+/// /roll [NdM] — roll dice and broadcast the result to the area.
+///
+/// Examples: /roll 2d6  /roll d20  /roll 3d100
+/// Limits: up to 20 dice, sides 2–10000.
+async fn cmd_roll(session: &mut ClientSession, state: &Arc<ServerState>, args: Vec<String>) {
+    use rand::Rng;
+
+    let notation = args.first().map(|s| s.as_str()).unwrap_or("1d6");
+
+    // Parse "NdM", "dM", or plain "N" (treat as 1dN).
+    let (count, sides) = if let Some(d) = notation.to_lowercase().find('d') {
+        let n_str = &notation[..d];
+        let m_str = &notation[d + 1..];
+        let n: u32 = if n_str.is_empty() { 1 } else { n_str.parse().unwrap_or(0) };
+        let m: u32 = m_str.parse().unwrap_or(0);
+        (n, m)
+    } else {
+        let n: u32 = notation.parse().unwrap_or(1);
+        (1, n)
+    };
+
+    if count == 0 || count > 20 || sides < 2 || sides > 10_000 {
+        session.server_message(
+            &state.config.server.name,
+            "Usage: /roll [NdM] — e.g. /roll 2d6, /roll d20 (N ≤ 20, sides 2–10000)",
+        );
+        return;
+    }
+
+    // Drop rng before any .await point — ThreadRng is !Send.
+    let (rolls, total) = {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let rolls: Vec<u32> = (0..count).map(|_| rng.gen_range(1..=sides)).collect();
+        let total: u32 = rolls.iter().sum();
+        (rolls, total)
+    };
+
+    let detail = if count > 1 {
+        let strs: Vec<String> = rolls.iter().map(|r| r.to_string()).collect();
+        format!("[{}] = {}", strs.join(", "), total)
+    } else {
+        total.to_string()
+    };
+
+    let msg = format!("{} rolled {}d{}: {}", session.ooc_name, count, sides, detail);
+    state
+        .broadcast_to_area(session.area_idx, "CT", &[&state.config.server.name, &msg, "1"])
+        .await;
+}
+
+/// /flip — flip a coin and broadcast the result to the area.
+async fn cmd_flip(session: &mut ClientSession, state: &Arc<ServerState>) {
+    // Drop rng before .await — ThreadRng is !Send.
+    let result = {
+        use rand::Rng;
+        if rand::thread_rng().gen_bool(0.5) { "Heads" } else { "Tails" }
+    };
+    let msg = format!("{} flipped a coin: {}", session.ooc_name, result);
+    state
+        .broadcast_to_area(session.area_idx, "CT", &[&state.config.server.name, &msg, "1"])
+        .await;
 }
 
 /// /reload — hot-reload characters, music, and backgrounds (ADMIN only).
