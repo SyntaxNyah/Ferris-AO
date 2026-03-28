@@ -828,6 +828,38 @@ async fn handle_mc(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
     }
     let name = ao_decode(&pkt.body[0]);
 
+    // URL streaming (http:// or https://) — CMs and DJs only.
+    let is_url = name.starts_with("http://") || name.starts_with("https://");
+    if is_url {
+        let is_cm = {
+            let area = state.areas[session.area_idx].read().await;
+            area.has_cm(session.uid.unwrap_or(0))
+        };
+        let can_stream = is_cm
+            || perms::has(session.permissions, perms::CM)
+            || perms::has(session.permissions, perms::DJ);
+        if !can_stream {
+            session.server_message(
+                &state.config.server.name,
+                "Only CMs and DJs can stream audio from URLs.",
+            );
+            return;
+        }
+        if !session.rl_mc.try_consume() {
+            return;
+        }
+        if !session.can_change_music() {
+            return;
+        }
+        let display_name = pkt.body.get(2).map(|s| s.as_str()).unwrap_or(&session.showname);
+        let effects = pkt.body.get(3).map(|s| s.as_str()).unwrap_or("0");
+        state
+            .broadcast_to_area(session.area_idx, "MC",
+                &[&pkt.body[0], &char_id_str, display_name, "1", "0", effects])
+            .await;
+        return;
+    }
+
     let is_music = {
         let rdata = state.reloadable.read().await;
         rdata.music.contains(&pkt.body[0].to_string())

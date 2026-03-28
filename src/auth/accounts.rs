@@ -24,6 +24,9 @@ pub mod perms {
     pub const MUTE: u64 = 1 << 10;
     pub const LOG: u64 = 1 << 11;
     pub const WATCHLIST: u64 = 1 << 12;
+    /// Allow `/play` (music + URL streaming) in any area regardless of CM status.
+    /// Assign via `setrole <user> dj` or directly with `setrole <user>` and PERM_DJ.
+    pub const DJ: u64 = 1 << 13;
     pub const ADMIN: u64 = u64::MAX;
 
     pub fn has(perms: u64, required: u64) -> bool {
@@ -37,6 +40,7 @@ pub mod perms {
                 | MOVE_USERS | MOD_SPEAK | BAN_INFO | MOD_CHAT | MUTE | LOG | WATCHLIST,
             "TRIAL" => KICK | MUTE | LOG,
             "CM" => CM,
+            "DJ" => DJ,
             _ => NONE,
         }
     }

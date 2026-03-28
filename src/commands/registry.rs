@@ -469,17 +469,30 @@ async fn cmd_play(session: &mut ClientSession, state: &Arc<ServerState>, args: V
         let area = state.areas[session.area_idx].read().await;
         area.has_cm(session.uid.unwrap_or(0))
     };
-    if !is_cm && !perms::has(session.permissions, perms::CM) {
-        session.server_message(&state.config.server.name, "You must be a CM to play music.");
+    let has_dj = perms::has(session.permissions, perms::DJ);
+    let has_cm_perm = perms::has(session.permissions, perms::CM);
+
+    if !is_cm && !has_dj && !has_cm_perm {
+        session.server_message(
+            &state.config.server.name,
+            "You must be a CM or have the DJ role to use /play.",
+        );
         return;
     }
     if args.is_empty() {
-        session.server_message(&state.config.server.name, "Usage: /play <song name>");
+        session.server_message(
+            &state.config.server.name,
+            "Usage: /play <song name or http/https URL>",
+        );
         return;
     }
     let song = args.join(" ");
-    let char_id_str = session.char_id.map(|id| id.to_string()).unwrap_or_else(|| "-1".to_string());
-    state.broadcast_to_area(session.area_idx, "MC", &[&song, &char_id_str, &session.ooc_name, "1", "0", "0"]).await;
+    let char_id_str = session.char_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "-1".to_string());
+    state
+        .broadcast_to_area(session.area_idx, "MC", &[&song, &char_id_str, &session.ooc_name, "1", "0", "0"])
+        .await;
 }
 
 fn cmd_narrator(session: &mut ClientSession, state: &Arc<ServerState>) {
