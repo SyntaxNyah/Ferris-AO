@@ -4,9 +4,12 @@
 //! AAO master server immediately on startup, then every 5 minutes, and
 //! immediately whenever the player count changes.
 //!
-//! When `reverse_proxy_mode = true`, advertises `wss_port` (the external
-//! HTTPS port) so the master server lists the server as WSS. Otherwise
-//! advertises `ws_port` (plain WebSocket).
+//! When `reverse_proxy_mode = true`, advertises BOTH `ws_port` (the external
+//! HTTP port, typically 80) AND `wss_port` (the external HTTPS port, typically
+//! 443). nginx forwards both external ports to the same internal `ws_port`
+//! listener, so only one Ferris-AO WebSocket process is needed.
+//! When `reverse_proxy_mode = false`, only `ws_port` (plain WebSocket) is
+//! advertised — there is no TLS terminator.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,11 +78,15 @@ fn build_advert(state: &ServerState) -> Advertisement {
     let srv = &state.config.server;
     let ms = &state.config.master_server;
 
-    // When behind a reverse proxy, the WebSocket is exposed as WSS via nginx.
-    // Advertise wss_port (external HTTPS port) so the master server shows wss://.
-    // Without a proxy, advertise ws_port (plain WS).
+    // When behind a reverse proxy, nginx routes both the plain HTTP port (e.g. 80)
+    // and the HTTPS port (e.g. 443) to the same internal ws_port listener.
+    // Advertise both so the master server can offer ws:// and wss:// entries.
+    // Without a proxy, only the plain ws_port is advertised.
     let (ws_port, wss_port) = if net.reverse_proxy_mode {
-        (None, Some(net.reverse_proxy_https_port))
+        (
+            Some(net.reverse_proxy_http_port),
+            Some(net.reverse_proxy_https_port),
+        )
     } else {
         (Some(net.ws_port), None)
     };

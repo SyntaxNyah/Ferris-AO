@@ -183,7 +183,7 @@ Ferris-AO is configured via `config.toml` in the working directory.
 | `addr` | string | `"https://servers.aceattorneyonline.com/servers"` | Master server URL |
 | `hostname` | string | *(unset)* | Optional hostname/IP to include in the advertisement. If unset, the master server infers it from the request |
 
-When `reverse_proxy_mode = true`, the server advertises `wss_port` (the `reverse_proxy_https_port` value, e.g. `443`) so the master server lists it as a WSS endpoint. When `reverse_proxy_mode = false`, it advertises `ws_port` (plain WebSocket).
+When `reverse_proxy_mode = true`, the server advertises **both** `ws_port` (`reverse_proxy_http_port`, e.g. `80`) **and** `wss_port` (`reverse_proxy_https_port`, e.g. `443`) to the master server. nginx routes both external ports to the same single internal `ws_port` listener, so only one Ferris-AO WebSocket process is needed. When `reverse_proxy_mode = false`, only `ws_port` (plain WebSocket, no TLS) is advertised.
 
 The server posts immediately on startup, every 5 minutes, and whenever the player count changes.
 
@@ -258,8 +258,8 @@ tcp_port = 27017
 ws_port = 27018
 bind_addr = "127.0.0.1"        # Only accept connections from nginx
 reverse_proxy_mode = true
-reverse_proxy_http_port = 80
-reverse_proxy_https_port = 443 # Advertised as wss_port to the master server
+reverse_proxy_http_port  = 80  # Advertised as ws://  to master server
+reverse_proxy_https_port = 443 # Advertised as wss:// to master server
 ws_ping_interval_secs = 30
 ws_ping_timeout_secs = 90
 
@@ -546,20 +546,24 @@ sudo ufw enable
 asset_url = "https://miku.pizza/assets"
 
 [network]
-bind_addr              = "0.0.0.0"   # TCP must be directly reachable
-tcp_port               = 27017       # Direct TCP — no nginx involved
-ws_port                = 27018       # nginx forwards hatsune.miku.pizza:443 → here
-reverse_proxy_mode     = true
-reverse_proxy_https_port = 443
+bind_addr                = "0.0.0.0"   # TCP must be directly reachable
+tcp_port                 = 27017       # Direct TCP — no nginx involved
+ws_port                  = 27018       # nginx forwards both :80 AND :443 → here
+reverse_proxy_mode       = true
+reverse_proxy_http_port  = 80          # Advertised as ws://  to master server
+reverse_proxy_https_port = 443         # Advertised as wss:// to master server
 
 [master_server]
 advertise = true
-hostname  = "hatsune.miku.pizza"    # Advertised in the server list
+hostname  = "hatsune.miku.pizza"       # Advertised in the server list
 ```
 
 The server will advertise:
 - **TCP:** `hatsune.miku.pizza:27017` (direct)
+- **WS:** `ws://hatsune.miku.pizza:80` (via nginx → localhost:27018)
 - **WSS:** `wss://hatsune.miku.pizza:443` (via nginx → localhost:27018)
+
+Both `ws://` and `wss://` are routed by nginx to the **same single** Ferris-AO WebSocket listener on port 27018 — no second process needed.
 
 #### How traffic flows
 
@@ -567,7 +571,11 @@ The server will advertise:
 Player (AO2 desktop)
   └─ TCP :27017 ──────────────────→ VPS :27017 → Ferris-AO (direct)
 
-Player (WebAO browser)
+Player (WebAO — plain WS)
+  └─ ws://hatsune.miku.pizza:80
+       └─ gray DNS → VPS :80 → nginx → localhost:27018 → Ferris-AO
+
+Player (WebAO — secure WSS)
   └─ wss://hatsune.miku.pizza:443
        └─ gray DNS → VPS :443 → nginx → localhost:27018 → Ferris-AO
 
@@ -579,7 +587,8 @@ Asset download
 #### The nginx config file (`nginx/nyahao.conf`)
 
 ```nginx
-# Redirect HTTP → HTTPS
+# Port 80 — plain WebSocket (ws://) + certbot + redirect
+# nginx routes WebSocket upgrades to Ferris-AO; plain HTTP → HTTPS redirect.
 server {
     listen 80;
     server_name hatsune.miku.pizza;
@@ -589,11 +598,23 @@ server {
     }
 
     location / {
-        return 301 https://$host$request_uri;
+        if ($http_upgrade = "websocket") {
+            proxy_pass http://127.0.0.1:27018;
+        }
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade    $http_upgrade;
+        proxy_set_header   Connection "upgrade";
+        proxy_set_header   Host       $host;
+        proxy_set_header   X-Real-IP       $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 7200s;
+        proxy_send_timeout 30s;
+        proxy_buffering    off;
+        return 301 https://$host$request_uri;  # Non-WebSocket → HTTPS
     }
 }
 
-# HTTPS + WebSocket proxy
+# Port 443 — WSS (wss://) WebSocket proxy
 server {
     listen 443 ssl;
     server_name hatsune.miku.pizza;
@@ -618,6 +639,8 @@ server {
     }
 }
 ```
+
+Both blocks forward to the **same** `localhost:27018` listener. Only one Ferris-AO process is needed.
 
 The full annotated config with TCP stream block and setup comments is at `nginx/nyahao.conf`.
 
@@ -653,7 +676,8 @@ your.domain.example {
 ws_port = 27018
 bind_addr = "127.0.0.1"
 reverse_proxy_mode = true
-reverse_proxy_https_port = 443
+reverse_proxy_http_port  = 80   # Advertised as ws://  to master server
+reverse_proxy_https_port = 443  # Advertised as wss:// to master server
 
 [master_server]
 advertise = true

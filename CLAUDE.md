@@ -590,7 +590,9 @@ When `config.master_server.advertise = true`:
 - Repeats every 5 minutes
 - Immediately re-posts when player count changes (via `player_watch_tx` watch channel)
 
-Payload includes `name`, `description`, `players`, `port` (TCP), and either `ws_port` or `wss_port` depending on `reverse_proxy_mode`.
+Payload includes `name`, `description`, `players`, `port` (TCP):
+- When `reverse_proxy_mode = false`: sends only `ws_port` (plain WebSocket, no TLS)
+- When `reverse_proxy_mode = true`: sends **both** `ws_port = reverse_proxy_http_port` (e.g. `80`) **and** `wss_port = reverse_proxy_https_port` (e.g. `443`). nginx routes both external ports to the same single internal `ws_port` listener — no second Ferris-AO process needed.
 
 ---
 
