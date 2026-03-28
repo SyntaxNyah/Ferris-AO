@@ -51,9 +51,14 @@ Ferris-AO is a server backend for the AO2 protocol. It manages areas (rooms), ch
 - **Argon2id passwords** — Moderator accounts use state-of-the-art password hashing
 - **Role-based permissions** — Fine-grained permission bitmask (admin, mod, trial, CM roles)
 - **Area system** — Multiple configurable areas with per-area evidence modes, backgrounds, locks, CMs, and HP tracking
-- **Moderation suite** — Kick, ban (temporary or permanent), mute (IC/OOC/music/judge variants), warn, announce
+- **Moderation suite** — Kick, ban (temporary or permanent), mute (IC/OOC/music/judge/shadow variants), warn, announce, private messaging, watchlist
+- **Watchlist** — Flag player HDIDs with notes; all authenticated mods are alerted when a watched player connects
+- **Pairing system** — `cccc_ic_support` pairing: players can request to appear side-by-side in IC messages
+- **Private messaging** — `/pm` and `/r` commands for direct player-to-player messages
+- **WebSocket keepalive** — Configurable Ping/Pong intervals to detect and drop stale connections
 - **PROXY Protocol v2** — Recovers real client IPs when running behind nginx (required for accurate IPIDs behind a proxy)
 - **Cloudflare-ready** — WebSocket proxy handles `CF-Connecting-IP` and `X-Real-IP` headers (trusted only from loopback)
+- **Packet size enforcement** — Configurable hard limit on incoming packet bytes; oversized packets are dropped before parsing
 - **Aggressive release optimization** — LTO + single codegen unit for minimal binary size and maximum throughput
 
 ---
@@ -97,7 +102,7 @@ Ferris-AO is a server backend for the AO2 protocol. It manages areas (rooms), ch
 | `network` | TCP and WebSocket transports, `AoTransport` abstraction |
 | `auth` | Account CRUD, Argon2id hashing |
 | `privacy` | IPID and HDID hashing via HMAC-SHA256 |
-| `moderation` | Ban records and `BanManager` |
+| `moderation` | Ban records (`BanManager`), watchlist (`WatchlistManager`) |
 | `storage` | Encrypted redb wrapper |
 | `game` | Areas, character slots, SM packet builder |
 | `commands` | All `/command` implementations |
@@ -148,6 +153,7 @@ Ferris-AO is configured via `config.toml` in the working directory.
 | `max_message_len` | integer | `256` | Maximum character length of a single IC message |
 | `asset_url` | string | `""` | URL to an asset bundle for clients to download (leave empty to disable) |
 | `multiclient_limit` | integer | `8` | Maximum simultaneous connections sharing the same IPID |
+| `max_packet_bytes` | integer | `8192` | Hard limit on incoming packet size in bytes. Packets larger than this are dropped before parsing. |
 
 ### `[network]`
 
@@ -159,6 +165,8 @@ Ferris-AO is configured via `config.toml` in the working directory.
 | `reverse_proxy_mode` | boolean | `false` | When `true`, trust `X-Forwarded-For` and `X-Real-IP` headers for real client IPs, and detect PROXY Protocol v2 on TCP. **Must be `false` for direct (no proxy) deployments** — trusting these headers without a proxy is a security risk. |
 | `reverse_proxy_http_port` | integer | `80` | External HTTP port advertised to the master server when `reverse_proxy_mode = true` |
 | `reverse_proxy_https_port` | integer | `443` | External HTTPS/WSS port advertised to the master server when `reverse_proxy_mode = true` |
+| `ws_ping_interval_secs` | integer | `30` | Seconds between WebSocket Ping frames for keepalive. Set to `0` to disable. |
+| `ws_ping_timeout_secs` | integer | `90` | Seconds to wait for a Pong response before treating the connection as stale and closing it. Set to `0` to disable. |
 
 ### `[privacy]`
 
@@ -196,12 +204,15 @@ max_players = 100
 max_message_len = 256
 asset_url = ""
 multiclient_limit = 8
+max_packet_bytes = 8192
 
 [network]
 tcp_port = 27017
 ws_port = 27018
 bind_addr = "0.0.0.0"
 reverse_proxy_mode = false
+ws_ping_interval_secs = 30
+ws_ping_timeout_secs = 90
 
 [privacy]
 # server_secret = "your_64_char_hex_string_here"
@@ -214,6 +225,19 @@ log_chat = false
 advertise = true
 addr = "https://servers.aceattorneyonline.com/servers"
 # hostname = "your.domain.example"
+
+[rate_limits]
+ic_rate = 3.0
+ic_burst = 5
+mc_rate = 1.0
+mc_burst = 3
+ct_rate = 2.0
+ct_burst = 5
+evidence_rate = 5.0
+evidence_burst = 10
+zz_cooldown_secs = 60
+conn_rate = 1.0
+conn_burst = 5
 ```
 
 **Example `config.toml` — behind nginx + Cloudflare:**
@@ -226,6 +250,8 @@ bind_addr = "127.0.0.1"        # Only accept connections from nginx
 reverse_proxy_mode = true
 reverse_proxy_http_port = 80
 reverse_proxy_https_port = 443 # Advertised as wss_port to the master server
+ws_ping_interval_secs = 30
+ws_ping_timeout_secs = 90
 
 [master_server]
 advertise = true
@@ -264,6 +290,7 @@ openssl rand -hex 32
 | `BANS` | Yes | Ban records keyed by ban ID |
 | `BANS_BY_HDID` | No | HDID → ban ID index for fast ban lookups |
 | `ACCOUNTS` | Yes | Moderator accounts keyed by username |
+| `WATCHLIST` | Yes | Watchlist entries keyed by hashed HDID |
 
 The database files (`nyahao.db`, `nyahao.db-shm`, `nyahao.db-wal`) are excluded from git via `.gitignore`.
 
@@ -336,17 +363,19 @@ lock_music = false
 
 **Area options:**
 
-| Key | Type | Description |
-|---|---|---|
-| `name` | string | Display name of the area |
-| `background` | string | Default background on area reset |
-| `evidence_mode` | string | Who can add/edit evidence: `any`, `cms`, `mods` |
-| `allow_iniswap` | bool | Allow players to use iniswapped characters |
-| `allow_cms` | bool | Allow players to become case managers (`/cm`) |
-| `force_nointerrupt` | bool | Force all messages to be non-interrupting |
-| `force_bglist` | bool | Restrict backgrounds to the server's `backgrounds.txt` list |
-| `lock_bg` | bool | Prevent background changes entirely |
-| `lock_music` | bool | Prevent music changes via packet (still changeable by mods) |
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `name` | string | *(required)* | Display name of the area |
+| `background` | string | *(required)* | Default background on area reset |
+| `evidence_mode` | string | *(required)* | Who can add/edit evidence: `any`, `cms`, `mods` |
+| `allow_iniswap` | bool | *(required)* | Allow players to use iniswapped characters |
+| `allow_cms` | bool | *(required)* | Allow players to become case managers (`/cm`) |
+| `force_nointerrupt` | bool | *(required)* | Force all messages to be non-interrupting |
+| `force_bglist` | bool | *(required)* | Restrict backgrounds to the server's `backgrounds.txt` list |
+| `lock_bg` | bool | *(required)* | Prevent background changes entirely |
+| `lock_music` | bool | *(required)* | Prevent music changes via packet (mods can still override) |
+| `max_players` | integer | *(none)* | Optional cap on players in this area. Omit for unlimited. |
+| `owner` | string | *(none)* | Optional account username that automatically receives CM status when they join this area. |
 
 ---
 
@@ -390,6 +419,7 @@ While the server is running, the process reads commands from stdin:
 | `say <message>` | Send a server-wide OOC announcement |
 | `mkusr <username> <password> <role>` | Create a moderator account (`admin`, `mod`, `trial`, `cm`) |
 | `rmusr <username>` | Delete a moderator account |
+| `setrole <username> <role>` | Change an existing account's role (`admin`, `mod`, `trial`, `cm`, `none`) |
 | `shutdown` | Gracefully shut down the server |
 | `help` | List available CLI commands |
 
@@ -631,6 +661,10 @@ Commands are entered in the OOC chat box prefixed with `/`.
 | `/play <song>` | Change the area music (if not locked) |
 | `/login <user> <pass>` | Authenticate as a moderator account |
 | `/logout` | Log out of your moderator account |
+| `/pair <uid>` | Request to pair with another player (side-by-side IC messages) |
+| `/unpair` | Cancel your current pairing |
+| `/pm <uid> <message>` | Send a private message to a player |
+| `/r <message>` | Reply to the last player who sent you a private message |
 
 ### Moderator Commands
 
@@ -644,9 +678,15 @@ These commands require specific permissions (see [Permission System](#permission
 | `/baninfo <hdid>` | `BAN_INFO` | Check the ban status for a given hashed HDID. |
 | `/mute <uid> [type]` | `MUTE` | Silence a player. Types: `ic`, `ooc`, `all` (default: `all`). |
 | `/unmute <uid>` | `MUTE` | Remove a mute from a player. |
+| `/shadowmute <uid>` | `MUTE` | Stealth mute a player — their messages appear to go through but are invisible to others. |
 | `/warn <uid> <reason>` | `KICK` | Increment a player's warning count and notify them. |
 | `/announce <message>` | `MOD_CHAT` | Send a server-wide OOC announcement to all players. |
 | `/modchat <message>` | `MOD_CHAT` | Send a message only visible to authenticated moderators. |
+| `/watchlist add <hdid> [note]` | `WATCHLIST` | Add a hashed HDID to the watchlist with an optional note. |
+| `/watchlist remove <hdid>` | `WATCHLIST` | Remove a hashed HDID from the watchlist. |
+| `/watchlist list` | `WATCHLIST` | List all watchlist entries with who added them and when. |
+| `/reload` | `ADMIN` | Hot-reload characters, music, and backgrounds without restarting. |
+| `/logoutall` | `ADMIN` | Force-logout all authenticated moderator sessions. |
 
 ---
 
@@ -668,6 +708,7 @@ Permissions are stored as a 64-bit bitmask on each account. Multiple permissions
 | `MOD_CHAT` | `512` | Can use modchat and send announcements |
 | `MUTE` | `1024` | Can mute/unmute players |
 | `LOG` | `2048` | Can access server logs |
+| `WATCHLIST` | `4096` | Can add/remove/list watchlist entries |
 | `ADMIN` | `ALL` | All permissions |
 
 ### Roles
@@ -677,7 +718,7 @@ When creating accounts via `mkusr`, specify one of these role names:
 | Role | Permissions Granted |
 |---|---|
 | `admin` | All permissions (`ADMIN`) |
-| `mod` / `moderator` | `KICK`, `BAN`, `BYPASS_LOCK`, `MOD_EVI`, `MODIFY_AREA`, `MOVE_USERS`, `MOD_SPEAK`, `BAN_INFO`, `MOD_CHAT`, `MUTE`, `LOG` |
+| `mod` / `moderator` | `KICK`, `BAN`, `BYPASS_LOCK`, `MOD_EVI`, `MODIFY_AREA`, `MOVE_USERS`, `MOD_SPEAK`, `BAN_INFO`, `MOD_CHAT`, `MUTE`, `LOG`, `WATCHLIST` |
 | `trial` | `KICK`, `MOD_CHAT`, `MUTE` |
 | `cm` | `CM`, `BYPASS_LOCK`, `MOD_EVI` |
 
@@ -784,7 +825,8 @@ Ferris-AO/
     │   └── hashing.rs      # IPID (daily-rotating) and HDID hashing via HMAC-SHA256
     ├── moderation/
     │   ├── mod.rs
-    │   └── bans.rs         # BanRecord, BanManager, soft-delete
+    │   ├── bans.rs         # BanRecord, BanManager, soft-delete
+    │   └── watchlist.rs    # WatchEntry, WatchlistManager
     ├── storage/
     │   ├── mod.rs
     │   └── db.rs           # EncryptedDb: redb + AES-256-GCM wrapper
@@ -800,9 +842,11 @@ Ferris-AO/
     │   ├── mod.rs
     │   ├── areas.rs        # Area struct, character slots, evidence, lock/CM logic
     │   └── characters.rs   # Character list loader, SM packet builder
-    └── commands/
-        ├── mod.rs
-        └── registry.rs     # All /command implementations (~785 lines)
+    ├── commands/
+    │   ├── mod.rs
+    │   └── registry.rs     # All /command implementations
+    ├── ratelimit.rs         # TokenBucket implementation
+    └── ms.rs               # Master server advertisement
 ```
 
 ---

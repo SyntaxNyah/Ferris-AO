@@ -1,13 +1,15 @@
 [[area]]
 name = "Lobby"
 background = "gs4"
-evidence_mode = "mods"
+evidence_mode = "mods"   # "any" | "cms" | "mods"
 allow_iniswap = false
 allow_cms = false
 force_nointerrupt = true
 force_bglist = true
 lock_bg = true
 lock_music = false
+# max_players = 30       # Optional: cap this area's population (omit for unlimited)
+# owner = ""             # Optional: account username that auto-gains CM when they join
 
 [[area]]
 name = "Courtroom"
@@ -19,6 +21,8 @@ force_nointerrupt = false
 force_bglist = false
 lock_bg = false
 lock_music = false
+# max_players = 20
+# owner = ""
 
 [[area]]
 name = "Investigation"
@@ -30,3 +34,5 @@ force_nointerrupt = false
 force_bglist = false
 lock_bg = false
 lock_music = false
+# max_players = 20
+# owner = ""

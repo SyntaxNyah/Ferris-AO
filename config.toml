@@ -6,6 +6,8 @@ max_players = 100
 max_message_len = 256
 asset_url = ""
 multiclient_limit = 8
+# Hard limit on incoming packet size in bytes. Packets exceeding this are dropped before parsing.
+max_packet_bytes = 8192
 
 [network]
 tcp_port = 27017
@@ -18,6 +20,10 @@ reverse_proxy_mode = false
 # External ports advertised to the master server when reverse_proxy_mode = true.
 reverse_proxy_http_port = 80
 reverse_proxy_https_port = 443
+# WebSocket keepalive: interval between Ping frames (seconds). 0 = disabled.
+ws_ping_interval_secs = 30
+# WebSocket keepalive: seconds to wait for a Pong before closing the connection. 0 = no timeout.
+ws_ping_timeout_secs = 90
 
 [privacy]
 # If unset, a server secret is generated at startup and stored in the database.
