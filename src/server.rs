@@ -23,6 +23,20 @@ use crate::{
 
 pub const VERSION: &str = "NyahAO v0.1.0";
 
+/// Cached snapshot of the last-broadcast ARUP values.
+///
+/// `send_*_arup` functions compare current area state against this snapshot
+/// before transmitting.  If nothing changed the broadcast is skipped entirely,
+/// saving a full client-list walk and socket writes after area events that
+/// don't actually change lobby-visible state.
+#[derive(Default)]
+pub struct ArupSnapshot {
+    pub player_counts: Vec<usize>,
+    pub statuses:      Vec<String>,
+    pub cm_labels:     Vec<String>,
+    pub lock_states:   Vec<String>,
+}
+
 /// Game data that can be hot-reloaded at runtime via /reload.
 pub struct ReloadableData {
     pub characters: Vec<String>,
@@ -99,6 +113,9 @@ pub struct ServerState {
     /// Per-IP connection rate limiters. Keyed on raw source IP (before IPID hashing).
     /// Checked in the TCP and WebSocket listeners before a session is created.
     pub conn_limiters: Mutex<HashMap<IpAddr, TokenBucket>>,
+
+    /// Last-broadcast ARUP values — used for delta suppression.
+    pub last_arup: Mutex<ArupSnapshot>,
 }
 
 impl ServerState {
@@ -137,6 +154,7 @@ impl ServerState {
             watchlist,
             player_watch_tx,
             conn_limiters: Mutex::new(HashMap::new()),
+            last_arup: Mutex::new(ArupSnapshot::default()),
         }
     }
 
@@ -226,67 +244,109 @@ impl ServerState {
         }
     }
 
-    /// Broadcast ARUP (player counts) to all clients.
+    /// Broadcast ARUP type 0 (player counts) — skipped when nothing changed.
     pub async fn send_player_arup(&self) {
-        let mut args: Vec<String> = vec!["0".into()];
-        for area_arc in &self.areas {
-            let area = area_arc.read().await;
-            args.push(area.players.to_string());
-        }
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        self.broadcast("ARUP", &arg_refs).await;
-    }
-
-    /// Broadcast ARUP (statuses) to all clients.
-    pub async fn send_status_arup(&self) {
-        let mut args: Vec<String> = vec!["1".into()];
-        for area_arc in &self.areas {
-            let area = area_arc.read().await;
-            args.push(area.status.as_str().to_string());
-        }
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        self.broadcast("ARUP", &arg_refs).await;
-    }
-
-    /// Broadcast ARUP (CM list) to all clients.
-    pub async fn send_cm_arup(&self) {
-        // Acquire reloadable first, then clients, then drop both before broadcast.
-        let characters: Vec<String> = {
-            let data = self.reloadable.read().await;
-            data.characters.clone()
-        };
-        let clients = self.clients.lock().await;
-        let mut args: Vec<String> = vec!["2".into()];
-        for area_arc in &self.areas {
-            let area = area_arc.read().await;
-            if area.cms.is_empty() {
-                args.push("FREE".into());
-            } else {
-                let cm_strs: Vec<String> = area.cms.iter().filter_map(|&uid| {
-                    clients.get(&uid).map(|h| {
-                        let char_name = h.char_id
-                            .and_then(|id| characters.get(id))
-                            .map(|s| s.as_str())
-                            .unwrap_or("Spectator");
-                        format!("{} ({})", char_name, uid)
-                    })
-                }).collect();
-                args.push(cm_strs.join(", "));
+        let current: Vec<usize> = {
+            let mut v = Vec::with_capacity(self.areas.len());
+            for a in &self.areas {
+                v.push(a.read().await.players);
             }
+            v
+        };
+        {
+            let mut snap = self.last_arup.lock().await;
+            if snap.player_counts == current {
+                return;
+            }
+            snap.player_counts = current.clone();
         }
-        drop(clients);
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        self.broadcast("ARUP", &arg_refs).await;
+        let mut args: Vec<String> = vec!["0".into()];
+        args.extend(current.iter().map(|n| n.to_string()));
+        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        self.broadcast("ARUP", &refs).await;
     }
 
-    /// Broadcast ARUP (lock states) to all clients.
-    pub async fn send_lock_arup(&self) {
-        let mut args: Vec<String> = vec!["3".into()];
-        for area_arc in &self.areas {
-            let area = area_arc.read().await;
-            args.push(area.lock.as_str().to_string());
+    /// Broadcast ARUP type 1 (statuses) — skipped when nothing changed.
+    pub async fn send_status_arup(&self) {
+        let current: Vec<String> = {
+            let mut v = Vec::with_capacity(self.areas.len());
+            for a in &self.areas {
+                v.push(a.read().await.status.as_str().to_string());
+            }
+            v
+        };
+        {
+            let mut snap = self.last_arup.lock().await;
+            if snap.statuses == current {
+                return;
+            }
+            snap.statuses = current.clone();
         }
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        self.broadcast("ARUP", &arg_refs).await;
+        let mut args: Vec<String> = vec!["1".into()];
+        args.extend(current.iter().cloned());
+        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        self.broadcast("ARUP", &refs).await;
+    }
+
+    /// Broadcast ARUP type 2 (CM labels) — skipped when nothing changed.
+    pub async fn send_cm_arup(&self) {
+        let characters: Vec<String> = {
+            self.reloadable.read().await.characters.clone()
+        };
+        let current: Vec<String> = {
+            let clients = self.clients.lock().await;
+            let mut v = Vec::with_capacity(self.areas.len());
+            for a in &self.areas {
+                let area = a.read().await;
+                if area.cms.is_empty() {
+                    v.push("FREE".into());
+                } else {
+                    let strs: Vec<String> = area.cms.iter().filter_map(|&uid| {
+                        clients.get(&uid).map(|h| {
+                            let char_name = h.char_id
+                                .and_then(|id| characters.get(id))
+                                .map(|s| s.as_str())
+                                .unwrap_or("Spectator");
+                            format!("{} ({})", char_name, uid)
+                        })
+                    }).collect();
+                    v.push(strs.join(", "));
+                }
+            }
+            v
+        };
+        {
+            let mut snap = self.last_arup.lock().await;
+            if snap.cm_labels == current {
+                return;
+            }
+            snap.cm_labels = current.clone();
+        }
+        let mut args: Vec<String> = vec!["2".into()];
+        args.extend(current.iter().cloned());
+        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        self.broadcast("ARUP", &refs).await;
+    }
+
+    /// Broadcast ARUP type 3 (lock states) — skipped when nothing changed.
+    pub async fn send_lock_arup(&self) {
+        let current: Vec<String> = {
+            let mut v = Vec::with_capacity(self.areas.len());
+            for a in &self.areas {
+                v.push(a.read().await.lock.as_str().to_string());
+            }
+            v
+        };
+        {
+            let mut snap = self.last_arup.lock().await;
+            if snap.lock_states == current {
+                return;
+            }
+            snap.lock_states = current.clone();
+        }
+        let mut args: Vec<String> = vec!["3".into()];
+        args.extend(current.iter().cloned());
+        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        self.broadcast("ARUP", &refs).await;
     }
 }
