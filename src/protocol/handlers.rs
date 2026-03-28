@@ -785,7 +785,7 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
 
     // Broadcast to area, skipping receivers who have ignored the sender.
     let sender_uid = session.uid.unwrap_or(u32::MAX);
-    debug!("MS broadcast uid={} area={} msg={:?}", sender_uid, session.area_idx, args[4]);
+    debug!("MS broadcast uid={} area={} fields={} packet=MS#{}#%", sender_uid, session.area_idx, arg_refs.len(), arg_refs.join("#"));
     state.broadcast_to_area_from(session.area_idx, sender_uid, "MS", &arg_refs).await;
 }
 
