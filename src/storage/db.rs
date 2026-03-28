@@ -3,7 +3,7 @@ use aes_gcm::{
     Aes256Gcm, Key, Nonce,
 };
 use anyhow::{Context, Result};
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition};
 
 // Table definitions
 pub const CONFIG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("config");
@@ -196,7 +196,7 @@ impl EncryptedDb {
         let table = read.open_table(WATCHLIST_TABLE)?;
         let mut entries = Vec::new();
         for item in table.iter()? {
-            let (_, v) = item?;
+            let (_, v): (_, redb::AccessGuard<&[u8]>) = item?;
             let decrypted = self.decrypt(v.value())?;
             let entry: crate::moderation::watchlist::WatchEntry = serde_json::from_slice(&decrypted)?;
             entries.push(entry);

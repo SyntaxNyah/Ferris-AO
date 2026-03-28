@@ -14,6 +14,9 @@ pub enum MuteState {
     Music,
     Judge,
     Parrot,
+    /// Shadowmute: the victim thinks their messages are going through, but
+    /// nobody else sees them. No notification is sent to the victim.
+    Shadowmute,
 }
 
 impl MuteState {
@@ -26,6 +29,7 @@ impl MuteState {
             MuteState::Music => "from changing the music",
             MuteState::Judge => "from judge controls",
             MuteState::Parrot => "parroted",
+            MuteState::Shadowmute => "shadowmuted",
         }
     }
 }
@@ -75,6 +79,10 @@ pub struct ClientSession {
     pub mute_until: Option<Instant>,
     pub warn_count: u32,
 
+    // Private messaging
+    /// UID of the last player who sent this client a PM (for /r reply).
+    pub last_pm_uid: Option<u32>,
+
     // Case preferences (5 roles)
     pub case_prefs: [bool; 5],
 
@@ -120,6 +128,7 @@ impl ClientSession {
             mute_state: MuteState::None,
             mute_until: None,
             warn_count: 0,
+            last_pm_uid: None,
             case_prefs: [false; 5],
             narrator: false,
             rl_ic: TokenBucket::new(rl.ic_rate, rl.ic_burst),
@@ -170,6 +179,10 @@ impl ClientSession {
         if self.char_id.is_none() {
             return false;
         }
+        // Shadowmuted: let the handler decide (victim sees their own message).
+        if self.mute_state == MuteState::Shadowmute {
+            return true;
+        }
         if matches!(self.mute_state, MuteState::Ic | MuteState::IcOoc) {
             return !self.check_mute();
         }
@@ -177,10 +190,19 @@ impl ClientSession {
     }
 
     pub fn can_speak_ooc(&mut self) -> bool {
+        // Shadowmuted: let the handler decide (victim sees their own message).
+        if self.mute_state == MuteState::Shadowmute {
+            return true;
+        }
         if matches!(self.mute_state, MuteState::Ooc | MuteState::IcOoc) {
             return !self.check_mute();
         }
         true
+    }
+
+    /// Returns true if this client is shadowmuted.
+    pub fn is_shadowmuted(&self) -> bool {
+        self.mute_state == MuteState::Shadowmute
     }
 
     pub fn can_change_music(&mut self) -> bool {

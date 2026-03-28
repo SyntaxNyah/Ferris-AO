@@ -4,6 +4,7 @@ use crate::{
     auth::accounts::perms,
     client::ClientSession,
     game::areas::{LockState, Status},
+    game::characters::{build_sm_packet, load_lines},
     protocol::packet::ao_encode,
     server::ServerState,
 };
@@ -38,6 +39,7 @@ pub async fn dispatch_command(
         "kick" => cmd_kick(session, state, args).await,
         "mute" => cmd_mute(session, state, args).await,
         "unmute" => cmd_unmute(session, state, args).await,
+        "shadowmute" => cmd_shadowmute(session, state, args).await,
         "warn" => cmd_warn(session, state, args).await,
         "ban" => cmd_ban(session, state, args).await,
         "unban" => cmd_unban(session, state, args).await,
@@ -49,6 +51,10 @@ pub async fn dispatch_command(
         "motd" => cmd_motd(session, state),
         "clear" => cmd_clear(session, state).await,
         "watchlist" => cmd_watchlist(session, state, args).await,
+        "pm" => cmd_pm(session, state, args).await,
+        "r" => cmd_r(session, state, args).await,
+        "reload" => cmd_reload(session, state).await,
+        "logoutall" => cmd_logoutall(session, state).await,
         _ => {
             session.server_message(&state.config.server.name, &format!("Unknown command: /{}", command));
         }
@@ -61,10 +67,14 @@ Commands:
 /help /about /who /move <area> /charselect /doc [text] /areainfo
 /cm [uid] /uncm [uid] /bg <bg> /status <status> /lock [-s] /unlock /play <song>
 /pair <uid> /unpair /narrator /login <user> <pass> /logout /mod <msg>
-[MOD] /kick <uid> /mute <uid> [ic|ooc|all] /unmute <uid> /warn <uid> <reason>
+/pm <uid> <msg>  — private message  |  /r <msg>  — reply to last PM
+/motd /clear
+[MOD] /kick <uid> /mute <uid> [ic|ooc|all] /unmute <uid> /shadowmute <uid>
+[MOD] /warn <uid> <reason>
 [MOD] /ban <uid> <reason> /unban <ban_id> /baninfo <hdid_hash> /announce <msg> /modchat <msg>
 [MOD] /watchlist add <hdid> [note] | /watchlist remove <hdid> | /watchlist list
-/motd /clear";
+[ADMIN] /reload  — hot-reload characters/music/backgrounds
+[ADMIN] /logoutall  — force-logout all authenticated sessions";
     session.server_message(&state.config.server.name, msg);
 }
 
@@ -73,11 +83,15 @@ fn cmd_about(session: &mut ClientSession, state: &Arc<ServerState>) {
 }
 
 async fn cmd_who(session: &mut ClientSession, state: &Arc<ServerState>) {
+    let characters = {
+        let rdata = state.reloadable.read().await;
+        rdata.characters.clone()
+    };
     let clients = state.clients.lock().await;
     let count = clients.len();
     let list: Vec<String> = clients.values().map(|h| {
         let char_name = h.char_id
-            .and_then(|id| state.characters.get(id))
+            .and_then(|id| characters.get(id))
             .map(|s| s.as_str())
             .unwrap_or("Spectator");
         format!("[{}] {}", h.uid, char_name)
@@ -95,17 +109,7 @@ async fn cmd_move(session: &mut ClientSession, state: &Arc<ServerState>, args: V
         return;
     }
     let target = args.join(" ");
-    let idx = if let Ok(n) = target.parse::<usize>() {
-        if n < state.areas.len() { Some(n) } else { None }
-    } else {
-        state.areas.iter().enumerate().find(|(_, a)| {
-            // SAFETY: we hold a read future but not a lock; we need a blocking check.
-            // For simplicity, match by iterating
-            false // placeholder - resolved below
-        }).map(|(i, _)| i)
-    };
-
-    // Name-based lookup
+    // Name-based lookup (or numeric index)
     let idx = if let Ok(n) = target.parse::<usize>() {
         if n < state.areas.len() { Some(n) } else { None }
     } else {
@@ -151,6 +155,17 @@ pub async fn change_area(session: &mut ClientSession, state: &Arc<ServerState>, 
     let old_idx = session.area_idx;
     let uid = session.uid.unwrap_or(0);
 
+    // Check per-area player cap before doing anything.
+    {
+        let new_area = state.areas[new_idx].read().await;
+        if let Some(max) = new_area.max_players {
+            if new_area.players >= max && !perms::has(session.permissions, perms::BYPASS_LOCK) {
+                session.server_message(&state.config.server.name, "That area is at capacity.");
+                return;
+            }
+        }
+    }
+
     // Leave old area
     {
         let mut old_area = state.areas[old_idx].write().await;
@@ -176,7 +191,6 @@ pub async fn change_area(session: &mut ClientSession, state: &Arc<ServerState>, 
 
     session.area_idx = new_idx;
 
-    // Join new area - check if char is taken
     {
         let mut new_area = state.areas[new_idx].write().await;
         if let Some(char_id) = session.char_id {
@@ -190,13 +204,24 @@ pub async fn change_area(session: &mut ClientSession, state: &Arc<ServerState>, 
         }
         new_area.players += 1;
 
+        // Auto-CM for area owner
+        if let Some(owner) = &new_area.owner.clone() {
+            if let Some(mod_name) = &session.mod_name {
+                if mod_name == owner {
+                    new_area.add_cm(uid);
+                }
+            }
+        }
+
         // Send area join info
         let taken = new_area.taken_strings();
         let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
+        let bg = new_area.bg.clone();
         session.send_packet("CharsCheck", &taken_refs);
         session.send_packet("HP", &["1", &new_area.def_hp.to_string()]);
         session.send_packet("HP", &["2", &new_area.pro_hp.to_string()]);
-        session.send_packet("BN", &[&new_area.bg.clone()]);
+        session.send_packet("BN", &[&bg]);
+        session.send_packet("BB", &[&bg]);
 
         let evi = new_area.evidence.clone();
         let evi_refs: Vec<&str> = evi.iter().map(|s| s.as_str()).collect();
@@ -210,7 +235,6 @@ pub async fn change_area(session: &mut ClientSession, state: &Arc<ServerState>, 
         let new_area = state.areas[new_idx].read().await;
         let taken = new_area.taken_strings();
         let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
-        let msg = format!("CharsCheck#{}#%", taken_refs.join("#"));
         drop(new_area);
         state.broadcast_to_area(new_idx, "CharsCheck", &taken_refs).await;
     }
@@ -339,14 +363,20 @@ async fn cmd_bg(session: &mut ClientSession, state: &Arc<ServerState>, args: Vec
     }
     let bg = args.join(" ");
     {
-        let area = state.areas[session.area_idx].read().await;
-        if area.lock_bg && !perms::has(session.permissions, perms::MODIFY_AREA) {
+        let (lock_bg, force_bglist) = {
+            let area = state.areas[session.area_idx].read().await;
+            (area.lock_bg, area.force_bglist)
+        };
+        if lock_bg && !perms::has(session.permissions, perms::MODIFY_AREA) {
             session.server_message(&state.config.server.name, "The background is locked in this area.");
             return;
         }
-        if area.force_bglist && !state.backgrounds.contains(&bg) {
-            session.server_message(&state.config.server.name, "That background is not in the server's list.");
-            return;
+        if force_bglist {
+            let rdata = state.reloadable.read().await;
+            if !rdata.backgrounds.contains(&bg) {
+                session.server_message(&state.config.server.name, "That background is not in the server's list.");
+                return;
+            }
         }
     }
     {
@@ -792,7 +822,8 @@ async fn cmd_pair(session: &mut ClientSession, state: &Arc<ServerState>, args: V
     let my_char_id = session.char_id.unwrap();
 
     // Read target info and check validity
-    let (target_char_id, target_char_name, is_mutual, target_tx) = {
+    // Acquire clients lock to read target info, then drop before awaiting reloadable.
+    let (target_char_id, is_mutual, target_tx) = {
         let clients = state.clients.lock().await;
         let target = match clients.get(&target_uid) {
             Some(h) => h,
@@ -806,10 +837,14 @@ async fn cmd_pair(session: &mut ClientSession, state: &Arc<ServerState>, args: V
             Some(id) => id,
             None => { session.server_message(&sname, "That player has no character selected."); return; }
         };
-        let target_char_name = state.characters.get(target_char_id).cloned().unwrap_or_default();
         let is_mutual = target.pair_wanted_id == Some(my_char_id);
         let target_tx = target.tx.clone();
-        (target_char_id, target_char_name, is_mutual, target_tx)
+        (target_char_id, is_mutual, target_tx)
+    };
+    // Clients lock dropped; now safe to await reloadable.
+    let target_char_name = {
+        let rdata = state.reloadable.read().await;
+        rdata.characters.get(target_char_id).cloned().unwrap_or_default()
     };
 
     // Update session pair state
@@ -835,10 +870,12 @@ async fn cmd_pair(session: &mut ClientSession, state: &Arc<ServerState>, args: V
         }
     }
 
-    let my_char_name = session.char_id
-        .and_then(|id| state.characters.get(id))
-        .map(|s| s.as_str())
-        .unwrap_or("Unknown");
+    let my_char_name = {
+        let rdata = state.reloadable.read().await;
+        session.char_id
+            .and_then(|id| rdata.characters.get(id).cloned())
+            .unwrap_or_else(|| "Unknown".to_string())
+    };
 
     if is_mutual {
         session.server_message(&sname, &format!("You are now paired with {}.", target_char_name));
@@ -870,11 +907,12 @@ async fn cmd_unpair(session: &mut ClientSession, state: &Arc<ServerState>) {
         return;
     }
 
-    let my_char_name = session.char_id
-        .and_then(|id| state.characters.get(id))
-        .map(|s| s.as_str())
-        .unwrap_or("Unknown")
-        .to_string();
+    let my_char_name = {
+        let rdata = state.reloadable.read().await;
+        session.char_id
+            .and_then(|id| rdata.characters.get(id).cloned())
+            .unwrap_or_else(|| "Unknown".to_string())
+    };
 
     // If force-paired, clear the partner's side and notify them
     if let Some(force_uid) = session.force_pair_uid {
@@ -1003,4 +1041,153 @@ async fn cmd_watchlist(session: &mut ClientSession, state: &Arc<ServerState>, ar
             session.server_message(&sname, "Usage: /watchlist add <hdid> [note] | /watchlist remove <hdid> | /watchlist list");
         }
     }
+}
+
+/// /pm <uid> <message> — send a private OOC message to another player.
+async fn cmd_pm(session: &mut ClientSession, state: &Arc<ServerState>, args: Vec<String>) {
+    if args.len() < 2 {
+        session.server_message(&state.config.server.name, "Usage: /pm <uid> <message>");
+        return;
+    }
+    let target_uid: u32 = match args[0].parse() {
+        Ok(n) => n,
+        Err(_) => { session.server_message(&state.config.server.name, "Invalid UID."); return; }
+    };
+    let my_uid = match session.uid {
+        Some(uid) => uid,
+        None => return,
+    };
+    if target_uid == my_uid {
+        session.server_message(&state.config.server.name, "You cannot PM yourself.");
+        return;
+    }
+    let message = args[1..].join(" ");
+    if message.is_empty() { return; }
+
+    let target_tx = {
+        let clients = state.clients.lock().await;
+        match clients.get(&target_uid) {
+            Some(h) => h.tx.clone(),
+            None => { session.server_message(&state.config.server.name, "Player not found."); return; }
+        }
+    };
+
+    let sender_name = if session.ooc_name.is_empty() {
+        format!("UID {}", my_uid)
+    } else {
+        session.ooc_name.clone()
+    };
+
+    // Send to target
+    let pm_header = ao_encode(&format!("[PM from {}]", sender_name));
+    let pm_msg = ao_encode(&message);
+    let _ = target_tx.send(format!("CT#{}#{}#1#%", pm_header, pm_msg));
+
+    // Confirm to sender
+    let confirm_header = ao_encode(&format!("[PM to UID {}]", target_uid));
+    session.send_packet("CT", &[&confirm_header, &pm_msg, "1"]);
+
+    // Tell the target session to update last_pm_uid (via internal message).
+    let _ = target_tx.send(format!("__PM_FROM_{}__", my_uid));
+
+    session.last_pm_uid = Some(target_uid);
+}
+
+/// /r <message> — reply to the last PM received.
+async fn cmd_r(session: &mut ClientSession, state: &Arc<ServerState>, args: Vec<String>) {
+    match session.last_pm_uid {
+        None => { session.server_message(&state.config.server.name, "No one to reply to."); }
+        Some(uid) => {
+            let mut new_args = vec![uid.to_string()];
+            new_args.extend(args);
+            cmd_pm(session, state, new_args).await;
+        }
+    }
+}
+
+/// /shadowmute <uid> — stealth-mute a player (MOD only).
+async fn cmd_shadowmute(session: &mut ClientSession, state: &Arc<ServerState>, args: Vec<String>) {
+    if !perms::has(session.permissions, perms::MUTE) {
+        session.server_message(&state.config.server.name, "No permission.");
+        return;
+    }
+    if args.is_empty() {
+        session.server_message(&state.config.server.name, "Usage: /shadowmute <uid>");
+        return;
+    }
+    let target_uid: u32 = match args[0].parse() {
+        Ok(n) => n,
+        Err(_) => { session.server_message(&state.config.server.name, "Invalid UID."); return; }
+    };
+    let clients = state.clients.lock().await;
+    if let Some(handle) = clients.get(&target_uid) {
+        handle.send("__SHADOWMUTE__");
+        session.server_message(&state.config.server.name, &format!("Shadowmuted UID {}.", target_uid));
+    } else {
+        session.server_message(&state.config.server.name, "Client not found.");
+    }
+}
+
+/// /reload — hot-reload characters, music, and backgrounds (ADMIN only).
+async fn cmd_reload(session: &mut ClientSession, state: &Arc<ServerState>) {
+    if !perms::has(session.permissions, perms::ADMIN) {
+        session.server_message(&state.config.server.name, "No permission. Admin required.");
+        return;
+    }
+
+    let characters = match load_lines(std::path::Path::new("data/characters.txt")) {
+        Ok(c) => c,
+        Err(e) => { session.server_message(&state.config.server.name, &format!("Failed to load characters.txt: {}", e)); return; }
+    };
+    let music = match load_lines(std::path::Path::new("data/music.txt")) {
+        Ok(m) => m,
+        Err(e) => { session.server_message(&state.config.server.name, &format!("Failed to load music.txt: {}", e)); return; }
+    };
+    let backgrounds = match load_lines(std::path::Path::new("data/backgrounds.txt")) {
+        Ok(b) => b,
+        Err(e) => { session.server_message(&state.config.server.name, &format!("Failed to load backgrounds.txt: {}", e)); return; }
+    };
+
+    // Build new SM packet using current area names.
+    let area_names: Vec<String> = {
+        let mut names = Vec::new();
+        for area_arc in &state.areas {
+            let area = area_arc.read().await;
+            names.push(area.name.clone());
+        }
+        names
+    };
+    let area_name_refs: Vec<&str> = area_names.iter().map(|s| s.as_str()).collect();
+    let sm_packet = build_sm_packet(&area_name_refs, &music);
+
+    let counts = format!("{} chars, {} music, {} backgrounds", characters.len(), music.len(), backgrounds.len());
+    {
+        let mut data = state.reloadable.write().await;
+        data.characters = characters;
+        data.music = music;
+        data.backgrounds = backgrounds;
+        data.sm_packet = sm_packet;
+    }
+
+    session.server_message(&state.config.server.name, &format!("Reloaded: {}", counts));
+    tracing::info!("Game data reloaded by {}: {}", session.mod_name.as_deref().unwrap_or("unknown"), counts);
+}
+
+/// /logoutall — force-logout all authenticated sessions except caller (ADMIN only).
+async fn cmd_logoutall(session: &mut ClientSession, state: &Arc<ServerState>) {
+    if !perms::has(session.permissions, perms::ADMIN) {
+        session.server_message(&state.config.server.name, "No permission. Admin required.");
+        return;
+    }
+    let my_uid = session.uid.unwrap_or(u32::MAX);
+    let clients = state.clients.lock().await;
+    let mut count = 0usize;
+    for handle in clients.values() {
+        if handle.authenticated && handle.uid != my_uid {
+            handle.send("__LOGOUT__");
+            count += 1;
+        }
+    }
+    drop(clients);
+    session.server_message(&state.config.server.name, &format!("Logged out {} authenticated session(s).", count));
 }

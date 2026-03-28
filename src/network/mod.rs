@@ -31,6 +31,23 @@ impl AoTransport {
             AoTransport::Ws(t) => t.recv_packet().await,
         }
     }
+
+    /// Send a keepalive ping (WebSocket only; no-op for TCP).
+    pub async fn keepalive_ping(&mut self) -> Result<()> {
+        match self {
+            AoTransport::Tcp(_) => Ok(()),
+            AoTransport::Ws(t) => t.send_ping().await,
+        }
+    }
+
+    /// Returns true if the transport has not received a pong within `timeout`
+    /// (WebSocket only; TCP always returns false).
+    pub fn is_stale(&self, timeout: std::time::Duration) -> bool {
+        match self {
+            AoTransport::Tcp(_) => false,
+            AoTransport::Ws(t) => t.is_stale(timeout),
+        }
+    }
 }
 
 /// Shared entry point called once transport + real IP are resolved.

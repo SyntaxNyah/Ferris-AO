@@ -22,7 +22,7 @@ pub fn build_sm_packet(area_names: &[&str], music: &[String]) -> String {
     }
 
     // If first music entry looks like a filename (contains '.'), add a category header
-    let mut music_refs: Vec<&str> = music.iter().map(|s| s.as_str()).collect();
+    let music_refs: Vec<&str> = music.iter().map(|s| s.as_str()).collect();
     if music_refs.first().map(|s| s.contains('.')).unwrap_or(false) {
         parts.push("Songs");
     }

@@ -117,4 +117,21 @@ impl AccountManager {
             None => Ok(None),
         }
     }
+
+    /// Update the permissions of an existing account. Returns Ok(true) if the
+    /// account was found and updated, Ok(false) if it does not exist.
+    pub fn set_permissions(&self, username: &str, new_perms: u64) -> Result<bool> {
+        let key = username.to_lowercase();
+        match self.db.accounts_get(&key)? {
+            None => Ok(false),
+            Some(bytes) => {
+                let mut account: Account = serde_json::from_slice(&bytes)
+                    .map_err(|e| anyhow::anyhow!("Decode error: {}", e))?;
+                account.permissions = new_perms;
+                let encoded = serde_json::to_vec(&account)?;
+                self.db.accounts_insert(&key, &encoded)?;
+                Ok(true)
+            }
+        }
+    }
 }

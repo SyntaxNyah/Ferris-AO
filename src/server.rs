@@ -21,6 +21,15 @@ use crate::{
 
 pub const VERSION: &str = "NyahAO v0.1.0";
 
+/// Game data that can be hot-reloaded at runtime via /reload.
+pub struct ReloadableData {
+    pub characters: Vec<String>,
+    pub music: Vec<String>,
+    pub backgrounds: Vec<String>,
+    /// Pre-built SM packet string (sent to every joining client).
+    pub sm_packet: String,
+}
+
 /// A handle to a connected client, stored in ServerState and readable by all tasks.
 #[derive(Clone)]
 pub struct ClientHandle {
@@ -56,9 +65,8 @@ impl ClientHandle {
 /// All shared server state. Held in Arc, accessed concurrently.
 pub struct ServerState {
     pub config: Config,
-    pub characters: Vec<String>,
-    pub music: Vec<String>,
-    pub backgrounds: Vec<String>,
+    /// Hot-reloadable game data (characters, music, backgrounds, SM packet).
+    pub reloadable: RwLock<ReloadableData>,
 
     /// All areas; each protected by an RwLock.
     pub areas: Vec<Arc<RwLock<Area>>>,
@@ -78,9 +86,6 @@ pub struct ServerState {
     pub bans: BanManager,
     pub watchlist: WatchlistManager,
 
-    /// Pre-built SM packet string (built once at startup).
-    pub sm_packet: String,
-
     /// Notifies the master server task whenever the player count changes.
     pub player_watch_tx: watch::Sender<usize>,
 
@@ -92,13 +97,10 @@ pub struct ServerState {
 impl ServerState {
     pub fn new(
         config: Config,
-        characters: Vec<String>,
-        music: Vec<String>,
-        backgrounds: Vec<String>,
+        reloadable: ReloadableData,
         areas: Vec<Arc<RwLock<Area>>>,
         privacy: PrivacyLayer,
         db: Arc<EncryptedDb>,
-        sm_packet: String,
         player_watch_tx: watch::Sender<usize>,
     ) -> Self {
         let max = config.server.max_players;
@@ -114,9 +116,7 @@ impl ServerState {
 
         Self {
             config,
-            characters,
-            music,
-            backgrounds,
+            reloadable: RwLock::new(reloadable),
             areas,
             clients: Mutex::new(HashMap::new()),
             uid_pool: Mutex::new(pool),
@@ -126,7 +126,6 @@ impl ServerState {
             accounts,
             bans,
             watchlist,
-            sm_packet,
             player_watch_tx,
             conn_limiters: Mutex::new(HashMap::new()),
         }
@@ -230,6 +229,11 @@ impl ServerState {
 
     /// Broadcast ARUP (CM list) to all clients.
     pub async fn send_cm_arup(&self) {
+        // Acquire reloadable first, then clients, then drop both before broadcast.
+        let characters: Vec<String> = {
+            let data = self.reloadable.read().await;
+            data.characters.clone()
+        };
         let clients = self.clients.lock().await;
         let mut args: Vec<String> = vec!["2".into()];
         for area_arc in &self.areas {
@@ -240,7 +244,7 @@ impl ServerState {
                 let cm_strs: Vec<String> = area.cms.iter().filter_map(|&uid| {
                     clients.get(&uid).map(|h| {
                         let char_name = h.char_id
-                            .and_then(|id| self.characters.get(id))
+                            .and_then(|id| characters.get(id))
                             .map(|s| s.as_str())
                             .unwrap_or("Spectator");
                         format!("{} ({})", char_name, uid)

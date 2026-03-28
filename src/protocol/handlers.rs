@@ -2,7 +2,7 @@
 /// Each handler takes: &mut ClientSession, &Packet, &Arc<ServerState>
 /// and runs inside the client's async task.
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     auth::accounts::perms,
@@ -106,6 +106,24 @@ async fn handle_internal(session: &mut ClientSession, state: &Arc<ServerState>, 
             session.mute_until = None;
             session.server_message(&state.config.server.name, "You have been unmuted.");
         }
+        "__SHADOWMUTE__" => {
+            // Stealth mute — do NOT notify the victim.
+            session.mute_state = MuteState::Shadowmute;
+        }
+        "__LOGOUT__" => {
+            // Force-logout: clear auth state, notify client, update handle.
+            session.authenticated = false;
+            session.permissions = 0;
+            session.mod_name = None;
+            session.send_packet("AUTH", &["-1"]);
+            session.server_message(&state.config.server.name, "You have been remotely logged out.");
+            if let Some(uid) = session.uid {
+                let mut clients = state.clients.lock().await;
+                if let Some(h) = clients.get_mut(&uid) {
+                    Arc::make_mut(h).authenticated = false;
+                }
+            }
+        }
         s if s.starts_with("__MUTE_") => {
             let kind = s.strip_prefix("__MUTE_").unwrap_or("all").strip_suffix("__").unwrap_or("all");
             session.mute_state = match kind {
@@ -116,6 +134,14 @@ async fn handle_internal(session: &mut ClientSession, state: &Arc<ServerState>, 
                 _ => MuteState::IcOoc,
             };
             session.server_message(&state.config.server.name, &format!("You have been muted ({}).", kind));
+        }
+        s if s.starts_with("__PM_FROM_") && s.ends_with("__") => {
+            // Update last_pm_uid so the victim can use /r
+            if let Some(uid_str) = s.strip_prefix("__PM_FROM_").and_then(|t| t.strip_suffix("__")) {
+                if let Ok(uid) = uid_str.parse::<u32>() {
+                    session.last_pm_uid = Some(uid);
+                }
+            }
         }
         _ => {}
     }
@@ -200,23 +226,33 @@ async fn handle_askchaa(session: &mut ClientSession, state: &Arc<ServerState>) {
         return;
     }
     session.joining = true;
+    let (char_count, music_count) = {
+        let rdata = state.reloadable.read().await;
+        (rdata.characters.len().to_string(), rdata.music.len().to_string())
+    };
     let area0 = state.areas[0].read().await;
-    let char_count = state.characters.len().to_string();
     let evi_count = area0.evidence.len().to_string();
-    let music_count = state.music.len().to_string();
     drop(area0);
     session.send_packet("SI", &[&char_count, &evi_count, &music_count]);
 }
 
 /// RC#%
 async fn handle_rc(session: &mut ClientSession, state: &Arc<ServerState>) {
-    let refs: Vec<&str> = state.characters.iter().map(|s| s.as_str()).collect();
+    let characters = {
+        let rdata = state.reloadable.read().await;
+        rdata.characters.clone()
+    };
+    let refs: Vec<&str> = characters.iter().map(|s| s.as_str()).collect();
     session.send_packet("SC", &refs);
 }
 
 /// RM#%
 async fn handle_rm(session: &mut ClientSession, state: &Arc<ServerState>) {
-    session.send_raw(&state.sm_packet);
+    let sm = {
+        let rdata = state.reloadable.read().await;
+        rdata.sm_packet.clone()
+    };
+    session.send_raw(&sm);
 }
 
 /// RD#%
@@ -257,11 +293,13 @@ async fn handle_rd(session: &mut ClientSession, state: &Arc<ServerState>) {
         let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
         let evi = area.evidence.clone();
         let evi_refs: Vec<&str> = evi.iter().map(|s| s.as_str()).collect();
+        let bg = area.bg.clone();
         session.send_packet("LE", &evi_refs);
         session.send_packet("CharsCheck", &taken_refs);
         session.send_packet("HP", &["1", &area.def_hp.to_string()]);
         session.send_packet("HP", &["2", &area.pro_hp.to_string()]);
-        session.send_packet("BN", &[&area.bg.clone()]);
+        session.send_packet("BN", &[&bg]);
+        session.send_packet("BB", &[&bg]);
     }
 
     // Send DONE
@@ -308,9 +346,13 @@ async fn handle_cc(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
         Ok(n) => n,
         Err(_) => return,
     };
-    if new_id >= state.characters.len() {
-        return;
-    }
+    let char_name = {
+        let rdata = state.reloadable.read().await;
+        if new_id >= rdata.characters.len() {
+            return;
+        }
+        rdata.characters[new_id].clone()
+    };
     let uid = session.uid.unwrap_or(0);
     let old_id = session.char_id;
 
@@ -321,7 +363,7 @@ async fn handle_cc(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
 
     if ok {
         session.char_id = Some(new_id);
-        session.showname = state.characters[new_id].clone();
+        session.showname = char_name;
         // Update client handle
         {
             let mut clients = state.clients.lock().await;
@@ -346,6 +388,7 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
     if !session.rl_ic.try_consume() {
         return;
     }
+    let shadowmuted = session.is_shadowmuted();
     if !session.can_speak_ic() {
         session.server_message(&state.config.server.name, "You are not allowed to speak in this area.");
         return;
@@ -461,11 +504,17 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
 
     // Iniswap check
     {
-        let area = state.areas[session.area_idx].read().await;
-        if !area.allow_iniswap {
+        let allow_iniswap = {
+            let area = state.areas[session.area_idx].read().await;
+            area.allow_iniswap
+        };
+        if !allow_iniswap {
             if let Some(char_id) = session.char_id {
-                let char_name = state.characters.get(char_id).map(|s| s.as_str()).unwrap_or("");
-                if !args[2].eq_ignore_ascii_case(char_name) {
+                let char_name_owned = {
+                    let rdata = state.reloadable.read().await;
+                    rdata.characters.get(char_id).cloned().unwrap_or_default()
+                };
+                if !args[2].eq_ignore_ascii_case(&char_name_owned) {
                     session.server_message(&state.config.server.name, "Iniswapping is not allowed in this area.");
                     return;
                 }
@@ -537,6 +586,11 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
     // ── Pairing ──────────────────────────────────────────────────────────────────
     let my_uid = session.uid.unwrap_or(u32::MAX);
     let my_char_id = session.char_id.unwrap_or(usize::MAX);
+    // Pre-fetch chars_len before acquiring clients lock to avoid holding both simultaneously.
+    let chars_len_for_pairing = {
+        let rdata = state.reloadable.read().await;
+        rdata.characters.len()
+    };
     {
         let mut clients = state.clients.lock().await;
 
@@ -580,7 +634,7 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
 
         if !pair_str.is_empty() && pair_str != "-1" {
             if let Ok(pair_id) = pair_str.parse::<usize>() {
-                if pair_id < state.characters.len() && session.char_id != Some(pair_id) {
+                if pair_id < chars_len_for_pairing && session.char_id != Some(pair_id) {
                     session.pair_info.wanted_id = Some(pair_id);
                     let force_uid = session.force_pair_uid;
                     let my_pos = args[5].clone(); // Use position after possible force-sync
@@ -638,12 +692,14 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
         wanted_id: session.pair_info.wanted_id,
     };
     session.last_msg = args[4].clone();
-    let char_name = session.char_id
-        .and_then(|id| state.characters.get(id))
-        .map(|s| s.as_str())
-        .unwrap_or("Unknown");
+    let char_name = {
+        let rdata = state.reloadable.read().await;
+        session.char_id
+            .and_then(|id| rdata.characters.get(id).cloned())
+            .unwrap_or_else(|| "Unknown".to_string())
+    };
     session.showname = if args[15].trim().is_empty() {
-        char_name.to_string()
+        char_name.clone()
     } else {
         args[15].clone()
     };
@@ -677,8 +733,14 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
         args[3] = String::new();
     }
 
-    // Broadcast to area
+    // Shadowmute: send the packet only back to the sender so they think it worked.
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    if shadowmuted {
+        session.send_packet("MS", &arg_refs);
+        return;
+    }
+
+    // Broadcast to area
     state.broadcast_to_area(session.area_idx, "MS", &arg_refs).await;
 }
 
@@ -690,7 +752,11 @@ async fn handle_mc(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
     }
     let name = ao_decode(&pkt.body[0]);
 
-    if state.music.contains(&pkt.body[0].to_string()) {
+    let is_music = {
+        let rdata = state.reloadable.read().await;
+        rdata.music.contains(&pkt.body[0].to_string())
+    };
+    if is_music {
         // Music change
         if !session.rl_mc.try_consume() {
             return;
@@ -822,6 +888,13 @@ async fn handle_ct(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
     }
 
     let encoded_name = ao_encode(&username);
+
+    // Shadowmute: send OOC only back to sender so they think it worked.
+    if session.is_shadowmuted() {
+        session.send_packet("CT", &[&encoded_name, message, "0"]);
+        return;
+    }
+
     state.broadcast_to_area(session.area_idx, "CT", &[&encoded_name, message, "0"]).await;
 }
 
@@ -901,10 +974,12 @@ async fn handle_zz(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
     }
     session.last_zz = Some(std::time::Instant::now());
     let reason = pkt.body.get(0).map(|s| s.as_str()).unwrap_or("");
-    let char_name = session.char_id
-        .and_then(|id| state.characters.get(id))
-        .map(|s| s.as_str())
-        .unwrap_or("Spectator");
+    let char_name = {
+        let rdata = state.reloadable.read().await;
+        session.char_id
+            .and_then(|id| rdata.characters.get(id).cloned())
+            .unwrap_or_else(|| "Spectator".to_string())
+    };
     let area_name = {
         let area = state.areas[session.area_idx].read().await;
         area.name.clone()
@@ -940,10 +1015,12 @@ async fn handle_casea(session: &mut ClientSession, state: &Arc<ServerState>, pkt
         session.server_message(&state.config.server.name, "You are not allowed to send case alerts here.");
         return;
     }
-    let char_name = session.char_id
-        .and_then(|id| state.characters.get(id))
-        .map(|s| s.as_str())
-        .unwrap_or("Spectator");
+    let char_name = {
+        let rdata = state.reloadable.read().await;
+        session.char_id
+            .and_then(|id| rdata.characters.get(id).cloned())
+            .unwrap_or_else(|| "Spectator".to_string())
+    };
     let area_name = {
         let area = state.areas[session.area_idx].read().await;
         area.name.clone()
@@ -995,7 +1072,6 @@ pub async fn run_client(
     state: Arc<ServerState>,
 ) {
     use tokio::sync::mpsc;
-    use tracing::debug;
 
     // Outbound channel: all sends from handlers go here; write task forwards to transport.
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
@@ -1013,12 +1089,31 @@ pub async fn run_client(
         return;
     }
 
+    // Keepalive ping timer (WebSocket only).
+    let ping_interval_secs = state.config.network.ws_ping_interval_secs;
+    let ping_timeout_secs = state.config.network.ws_ping_timeout_secs;
+    let use_keepalive = ping_interval_secs > 0;
+
+    let mut ping_timer = tokio::time::interval(
+        std::time::Duration::from_secs(if use_keepalive { ping_interval_secs } else { 30 }),
+    );
+    ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Skip the first immediate tick so the ping doesn't fire at time 0.
+    ping_timer.tick().await;
+
     // Drive read and write concurrently within the same task.
-    // We poll both recv_packet and the outbound channel drain at once.
     loop {
         tokio::select! {
-            // Forward outbound messages.
+            // Forward outbound messages — intercept internal control messages.
             Some(msg) = rx.recv() => {
+                // Internal cross-task control messages start with "__".
+                // Do NOT send them to the wire; dispatch them locally.
+                if msg.starts_with("__") {
+                    // Strip the trailing "#%" if present before using as header.
+                    let header = msg.trim_end_matches("#%").trim_end_matches('#');
+                    handle_internal(&mut session, &state, header).await;
+                    continue;
+                }
                 if let Err(e) = transport.send(&msg).await {
                     debug!("Send error: {}", e);
                     break;
@@ -1038,26 +1133,55 @@ pub async fn run_client(
                     }
                 }
             }
+
+            // Keepalive ping tick (WebSocket only).
+            _ = ping_timer.tick(), if use_keepalive => {
+                if ping_timeout_secs > 0 {
+                    let timeout = std::time::Duration::from_secs(ping_timeout_secs);
+                    if transport.is_stale(timeout) {
+                        debug!("WS keepalive timeout for IPID={}", session.ipid);
+                        break;
+                    }
+                }
+                let _ = transport.keepalive_ping().await;
+            }
         }
     }
 
     // Cleanup: release character slot, decrement player count, free UID.
     if let Some(uid) = session.uid {
-        // Release character in the area.
-        if let Some(char_id) = session.char_id {
-            let mut area = state.areas[session.area_idx].write().await;
-            if char_id < area.taken.len() {
-                area.taken[char_id] = false;
-            }
+        // Release character and capture taken strings for CharsCheck broadcast.
+        let area_idx = session.area_idx;
+        let chars_check_taken: Option<Vec<String>> = if let Some(char_id) = session.char_id {
+            let taken_strings = {
+                let mut area = state.areas[area_idx].write().await;
+                if char_id < area.taken.len() {
+                    area.taken[char_id] = false;
+                }
+                area.players = area.players.saturating_sub(1);
+                area.cms.retain(|&c| c != uid);
+                area.taken_strings()
+            };
+            Some(taken_strings)
+        } else {
+            // No character — still decrement player count for the area.
+            let mut area = state.areas[area_idx].write().await;
             area.players = area.players.saturating_sub(1);
             area.cms.retain(|&c| c != uid);
-        }
+            None
+        };
 
         // Remove from client list.
         state.remove_client(uid).await;
         state.player_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         let _ = state.player_watch_tx.send(state.player_count());
         state.free_uid(uid).await;
+
+        // Broadcast CharsCheck to area so remaining clients update their char lists.
+        if let Some(taken) = chars_check_taken {
+            let refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
+            state.broadcast_to_area(area_idx, "CharsCheck", &refs).await;
+        }
 
         // Broadcast updated ARUP.
         state.send_player_arup().await;

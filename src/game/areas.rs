@@ -59,6 +59,12 @@ pub struct AreaConfig {
     pub force_bglist: bool,
     pub lock_bg: bool,
     pub lock_music: bool,
+    /// Maximum number of players allowed in this area. None = unlimited.
+    #[serde(default)]
+    pub max_players: Option<usize>,
+    /// Account username that auto-receives CM when they join this area.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +83,10 @@ pub struct Area {
     pub force_bglist: bool,
     pub lock_bg: bool,
     pub lock_music: bool,
+    /// Per-area max player cap. None means unlimited.
+    pub max_players: Option<usize>,
+    /// Account username that is auto-CM'd when they join this area.
+    pub owner: Option<String>,
 
     // Mutable state
     pub taken: Vec<bool>,
@@ -111,6 +121,8 @@ impl Area {
             force_bglist: cfg.force_bglist,
             lock_bg: cfg.lock_bg,
             lock_music: cfg.lock_music,
+            max_players: cfg.max_players,
+            owner: cfg.owner.clone(),
 
             taken: vec![false; char_count],
             players: 0,

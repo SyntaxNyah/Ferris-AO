@@ -29,6 +29,8 @@ pub struct TcpTransport {
     /// Bytes peeked ahead of time before the transport was created.
     /// These are replayed as the first data from the stream.
     prefix: Vec<u8>,
+    /// Hard packet size cap. Packets exceeding this are dropped before parsing.
+    max_packet_bytes: usize,
 }
 
 impl TcpTransport {
@@ -36,12 +38,14 @@ impl TcpTransport {
         reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
         writer: tokio::net::tcp::OwnedWriteHalf,
         prefix: Vec<u8>,
+        max_packet_bytes: usize,
     ) -> Self {
         Self {
             reader,
             writer,
             buf: String::new(),
             prefix,
+            max_packet_bytes,
         }
     }
 
@@ -69,6 +73,13 @@ impl TcpTransport {
                 let raw = self.buf[..idx].to_string();
                 self.buf.drain(..=idx);
                 return Some(Packet::parse(raw.as_bytes()).map_err(Into::into));
+            }
+
+            // Hard-drop if buffer exceeds the packet size cap (no '%' found yet).
+            if self.max_packet_bytes > 0 && self.buf.len() > self.max_packet_bytes {
+                warn!("TCP packet exceeded max_packet_bytes ({}); dropping connection.", self.max_packet_bytes);
+                self.buf.clear();
+                return Some(Err(anyhow::anyhow!("packet too large")));
             }
 
             // Read more data.
@@ -157,7 +168,7 @@ async fn accept_tcp(
         return Ok(());
     }
 
-    let transport = AoTransport::Tcp(TcpTransport::new(reader, write_half, prefix));
+    let transport = AoTransport::Tcp(TcpTransport::new(reader, write_half, prefix, state.config.server.max_packet_bytes));
     handle_connection(transport, real_ip, state, shutdown).await;
     Ok(())
 }

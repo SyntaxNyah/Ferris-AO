@@ -20,7 +20,7 @@ use tokio_tungstenite::{
     },
     WebSocketStream,
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::protocol::packet::Packet;
 use crate::server::ServerState;
@@ -31,12 +31,27 @@ use super::{handle_connection, AoTransport};
 pub struct WsTransport {
     ws: WebSocketStream<TcpStream>,
     buf: String,
+    /// Time of the last received Pong frame (or transport creation).
+    pub last_pong: std::time::Instant,
+    /// Hard packet size cap in bytes.
+    max_packet_bytes: usize,
 }
 
 impl WsTransport {
     pub async fn send(&mut self, data: &str) -> Result<()> {
-        self.ws.send(Message::Text(data.to_string())).await?;
+        self.ws.send(Message::Text(data.to_string().into())).await?;
         Ok(())
+    }
+
+    /// Send a WebSocket Ping frame for keepalive.
+    pub async fn send_ping(&mut self) -> Result<()> {
+        self.ws.send(Message::Ping(vec![].into())).await?;
+        Ok(())
+    }
+
+    /// Returns true if no Pong has been received within `timeout`.
+    pub fn is_stale(&self, timeout: std::time::Duration) -> bool {
+        self.last_pong.elapsed() > timeout
     }
 
     pub async fn recv_packet(&mut self) -> Option<Result<Packet>> {
@@ -46,6 +61,13 @@ impl WsTransport {
                 let raw = self.buf[..idx].to_string();
                 self.buf.drain(..=idx);
                 return Some(Packet::parse(raw.as_bytes()).map_err(Into::into));
+            }
+
+            // Hard-drop if buffer exceeds the packet size cap.
+            if self.max_packet_bytes > 0 && self.buf.len() > self.max_packet_bytes {
+                warn!("WS packet exceeded max_packet_bytes ({}); dropping connection.", self.max_packet_bytes);
+                self.buf.clear();
+                return Some(Err(anyhow::anyhow!("packet too large")));
             }
 
             // Receive next WebSocket frame.
@@ -58,7 +80,11 @@ impl WsTransport {
                         }
                     }
                     Message::Close(_) => return None,
-                    Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
+                    Message::Ping(_) => {} // tungstenite auto-replies with Pong
+                    Message::Pong(_) => {
+                        self.last_pong = std::time::Instant::now();
+                    }
+                    Message::Frame(_) => {}
                 },
                 Err(e) => return Some(Err(e.into())),
             }
@@ -113,7 +139,18 @@ async fn accept_ws(
     let extracted_ip: Arc<Mutex<Option<IpAddr>>> = Arc::new(Mutex::new(None));
     let extracted_ip_cb = Arc::clone(&extracted_ip);
 
-    let ws = accept_hdr_async(stream, move |req: &Request, res: Response| {
+    let ws = accept_hdr_async(stream, move |req: &Request, mut res: Response| {
+        // Sub-protocol acknowledgement: if the client advertises "AO2", echo it back.
+        if let Some(proto_hdr) = req.headers().get("sec-websocket-protocol") {
+            if let Ok(p) = proto_hdr.to_str() {
+                if p.split(',').any(|s| s.trim() == "AO2") {
+                    if let Ok(val) = "AO2".parse() {
+                        res.headers_mut().insert("sec-websocket-protocol", val);
+                    }
+                }
+            }
+        }
+
         if proxy_mode {
             let headers = req.headers();
             // Priority: X-Forwarded-For (first address) → X-Real-IP
@@ -148,7 +185,13 @@ async fn accept_ws(
         return Ok(());
     }
 
-    let transport = AoTransport::Ws(WsTransport { ws, buf: String::new() });
+    let max_packet_bytes = state.config.server.max_packet_bytes;
+    let transport = AoTransport::Ws(WsTransport {
+        ws,
+        buf: String::new(),
+        last_pong: std::time::Instant::now(),
+        max_packet_bytes,
+    });
     handle_connection(transport, real_ip, state, shutdown).await;
     Ok(())
 }

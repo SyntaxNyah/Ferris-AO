@@ -23,6 +23,10 @@ pub struct ServerConfig {
     pub max_message_len: usize,
     pub asset_url: String,
     pub multiclient_limit: usize,
+    /// Hard limit on incoming packet size in bytes. Packets larger than this
+    /// are dropped before parsing. Default: 8192.
+    #[serde(default = "default_max_packet_bytes")]
+    pub max_packet_bytes: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -40,10 +44,20 @@ pub struct NetworkConfig {
     /// External HTTPS port advertised when reverse_proxy_mode is true (e.g. 443).
     #[serde(default = "default_https_port")]
     pub reverse_proxy_https_port: u16,
+    /// Interval in seconds between WebSocket ping frames. 0 disables keepalive.
+    #[serde(default = "default_ws_ping_interval")]
+    pub ws_ping_interval_secs: u64,
+    /// Seconds after which a WS client that has not responded to pings is
+    /// considered stale and disconnected. 0 disables timeout.
+    #[serde(default = "default_ws_ping_timeout")]
+    pub ws_ping_timeout_secs: u64,
 }
 
 fn default_http_port() -> u16 { 80 }
 fn default_https_port() -> u16 { 443 }
+fn default_ws_ping_interval() -> u64 { 30 }
+fn default_ws_ping_timeout() -> u64 { 90 }
+fn default_max_packet_bytes() -> usize { 8192 }
 
 #[derive(Debug, Deserialize)]
 pub struct PrivacyConfig {

@@ -27,7 +27,7 @@ use crate::{
     config::Config,
     game::{areas::load_areas, characters::build_sm_packet, characters::load_lines},
     privacy::hashing::PrivacyLayer,
-    server::ServerState,
+    server::{ReloadableData, ServerState},
     storage::db::EncryptedDb,
 };
 
@@ -46,6 +46,16 @@ async fn main() -> Result<()> {
         .init();
 
     info!("Starting NyahAO server…");
+
+    // ── Config validation ──────────────────────────────────────────────────────
+    if config.server.name.is_empty() {
+        warn!("server.name is empty in config.toml — clients will see a blank server name.");
+    } else if config.server.name == "My AO Server" || config.server.name == "NyahAO Server" {
+        warn!("server.name is still a placeholder ('{}') — consider changing it in config.toml.", config.server.name);
+    }
+    if config.server.max_players == 0 {
+        warn!("server.max_players is 0 — no clients will be able to connect.");
+    }
 
     // ── Determine AES-256 key for the DB ───────────────────────────────────────
     let db_key: [u8; 32] = {
@@ -111,6 +121,9 @@ async fn main() -> Result<()> {
     let area_names: Vec<&str> = areas_raw.iter().map(|a| a.name.as_str()).collect();
     let sm_packet = build_sm_packet(&area_names, &music);
 
+    // Bundle hot-reloadable data.
+    let reloadable = ReloadableData { characters, music, backgrounds, sm_packet };
+
     // Wrap areas in Arc<RwLock<_>>.
     let areas: Vec<Arc<tokio::sync::RwLock<crate::game::areas::Area>>> = areas_raw
         .into_iter()
@@ -121,13 +134,10 @@ async fn main() -> Result<()> {
     let (player_watch_tx, player_watch_rx) = watch::channel(0usize);
     let state = Arc::new(ServerState::new(
         config,
-        characters,
-        music,
-        backgrounds,
+        reloadable,
         areas,
         privacy,
         Arc::clone(&db),
-        sm_packet,
         player_watch_tx,
     ));
 
@@ -281,6 +291,22 @@ async fn run_stdin_cli(state: Arc<ServerState>, shutdown_tx: broadcast::Sender<(
                     Err(e) => println!("[CLI] Error: {}", e),
                 }
             }
+            "setrole" => {
+                // setrole <username> <role>
+                if arg1.is_empty() || arg2.is_empty() {
+                    println!("[CLI] Usage: setrole <username> <role>  (roles: admin, mod, trial, cm, none)");
+                    continue;
+                }
+                let perms = crate::auth::accounts::perms::from_role(&arg2);
+                let accounts = state.accounts.clone();
+                let u = arg1.clone();
+                match tokio::task::spawn_blocking(move || accounts.set_permissions(&u, perms)).await {
+                    Ok(Ok(true)) => println!("[CLI] Updated role for '{}' to '{}'.", arg1, arg2),
+                    Ok(Ok(false)) => println!("[CLI] User '{}' not found.", arg1),
+                    Ok(Err(e)) => println!("[CLI] Error: {}", e),
+                    Err(e) => println!("[CLI] Task error: {}", e),
+                }
+            }
             "shutdown" => {
                 println!("[CLI] Shutting down server…");
                 let _ = shutdown_tx.send(());
@@ -289,12 +315,13 @@ async fn run_stdin_cli(state: Arc<ServerState>, shutdown_tx: broadcast::Sender<(
             "help" => {
                 println!(
                     "[CLI] Commands:\n\
-                     \x20 players            — list connected players\n\
-                     \x20 say <msg>          — broadcast OOC message\n\
-                     \x20 mkusr <u> <p> [r]  — create user (roles: admin,mod,trial,cm)\n\
-                     \x20 rmusr <u>          — delete user\n\
-                     \x20 shutdown           — stop the server\n\
-                     \x20 help               — this help"
+                     \x20 players                 — list connected players\n\
+                     \x20 say <msg>               — broadcast OOC message\n\
+                     \x20 mkusr <u> <p> [r]       — create user (roles: admin,mod,trial,cm)\n\
+                     \x20 rmusr <u>               — delete user\n\
+                     \x20 setrole <u> <role>       — change a user's role (admin,mod,trial,cm,none)\n\
+                     \x20 shutdown                — stop the server\n\
+                     \x20 help                    — this help"
                 );
             }
             other => {
