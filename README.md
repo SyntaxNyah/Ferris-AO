@@ -11,8 +11,7 @@ Built with async-first design using Tokio, Ferris-AO implements the full AO2 pro
 - [What is Ferris-AO](#what-is-ferris-ao)
 - [Features](#features)
 - [Architecture](#architecture)
-- [Requirements](#requirements)
-- [Installation](#installation)
+- [Build Guide](#build-guide)
 - [Configuration](#configuration)
 - [Database Setup](#database-setup)
 - [Data Files](#data-files)
@@ -111,30 +110,136 @@ Ferris-AO is a server backend for the AO2 protocol. It manages areas (rooms), ch
 
 ---
 
-## Requirements
+## Build Guide
 
-- **Rust** 1.75 or later (`cargo build --release`)
-- **Linux** recommended for production (nginx stream module available)
-- **nginx** (optional) — required for TLS termination, rate limiting, and PROXY Protocol v2
-- **Cloudflare** (optional) — free tier covers WebSocket; TCP passthrough requires Cloudflare Spectrum (paid)
+### 1. Install Rust
+
+If you don't have Rust installed, get it from [rustup.rs](https://rustup.rs/):
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+```
+
+Ferris-AO requires **Rust 1.75 or later**. Check your version:
+
+```bash
+rustc --version
+```
 
 ---
 
-## Installation
+### 2. Clone the repo
 
 ```bash
 git clone https://github.com/SyntaxNyah/Ferris-AO.git
 cd Ferris-AO
-cargo build --release
 ```
 
-The compiled binary will be at `target/release/nyahao` (or `nyahao.exe` on Windows).
+---
 
-Copy and edit the example config:
+### 3. Build
+
+**Development build** (faster to compile, slower to run — for testing):
+```bash
+cargo build
+./target/debug/nyahao
+```
+
+**Release build** (optimised, LTO enabled — use this for production):
+```bash
+cargo build --release
+./target/release/nyahao
+```
+
+The binary is named `nyahao` (or `nyahao.exe` on Windows).
+
+---
+
+### 4. Set up the database key
+
+Ferris-AO encrypts all ban records, accounts, and watchlist entries with AES-256-GCM. You need to provide a 32-byte key as a 64-character hex string via the `NYAHAO_DB_KEY` environment variable.
+
+Generate a secure key (run once, save it somewhere safe):
 
 ```bash
-cp config.toml config.toml.bak   # keep a backup
-# edit config.toml with your settings
+openssl rand -hex 32
+# example output: a3f1c2e4b5d6789012345678abcdef01234567890abcdef1234567890abcdef12
+```
+
+> **Important:** If you lose this key or change it, the database becomes unreadable. Store it securely (e.g. in a password manager or a secrets manager). Never commit it to git.
+
+---
+
+### 5. Edit `config.toml`
+
+The repo includes a ready-to-use `config.toml`. At minimum, set your server name and description:
+
+```toml
+[server]
+name        = "My AO Server"
+description = "A cool roleplay server"
+motd        = "Welcome!"
+```
+
+Everything else has sensible defaults. See the [Configuration](#configuration) section for all options.
+
+---
+
+### 6. Run the server
+
+```bash
+NYAHAO_DB_KEY="your_64_char_hex_key" ./target/release/nyahao
+```
+
+On first launch, Ferris-AO will:
+- Create `nyahao.db` (the encrypted database)
+- Generate a `server_secret` for IPID/HDID hashing and store it in the DB
+- Start listening on TCP port 27017 and WebSocket port 27018
+
+---
+
+### 7. Create your first admin account
+
+While the server is running, type in the same terminal (stdin CLI):
+
+```
+mkusr admin yourpassword admin
+```
+
+Then log in from any connected client with `/login admin yourpassword`.
+
+---
+
+### Running as a systemd service (Linux production)
+
+Create `/etc/systemd/system/ferris-ao.service`:
+
+```ini
+[Unit]
+Description=Ferris-AO Attorney Online Server
+After=network.target
+
+[Service]
+Type=simple
+User=ao
+WorkingDirectory=/opt/ferris-ao
+ExecStart=/opt/ferris-ao/nyahao
+Environment=NYAHAO_DB_KEY=your_64_char_hex_key_here
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then enable and start it:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable ferris-ao
+sudo systemctl start ferris-ao
+sudo journalctl -u ferris-ao -f   # follow logs
 ```
 
 ---
@@ -410,33 +515,16 @@ lock_music = false
 
 ## Running the Server
 
-**Basic:**
 ```bash
-NYAHAO_DB_KEY="your_hex_key" ./target/release/nyahao
+NYAHAO_DB_KEY="your_64_char_hex_key" ./target/release/nyahao
 ```
 
-**With custom log level:**
+Override the log level at any time with `RUST_LOG`:
 ```bash
-RUST_LOG=debug NYAHAO_DB_KEY="your_hex_key" ./target/release/nyahao
+RUST_LOG=debug NYAHAO_DB_KEY="..." ./target/release/nyahao
 ```
 
-**As a systemd service (`/etc/systemd/system/ferris-ao.service`):**
-```ini
-[Unit]
-Description=Ferris-AO Attorney Online Server
-After=network.target
-
-[Service]
-Type=simple
-User=ao
-WorkingDirectory=/opt/ferris-ao
-ExecStart=/opt/ferris-ao/nyahao
-Environment=NYAHAO_DB_KEY=your_hex_key_here
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-```
+See the [Build Guide](#build-guide) above for full setup instructions, systemd service config, and first-run steps.
 
 ### Admin CLI
 
