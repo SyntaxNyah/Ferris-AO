@@ -81,6 +81,13 @@ jobs:
             | Cluster gossip + consistent hash ring (scaffolding) | — | ✅ |
             | First-run bootstrap (writes all files on first launch) | — | ✅ |
             | WebSocket write-buffer tuning | — | ✅ |
+            | TOTP two-factor authentication | — | ✅ RFC 6238, works with any TOTP app |
+            | Argon2id pepper (`NYAHAO_PEPPER` env var) | — | ✅ HMAC-SHA256 pre-hash |
+            | Native TLS WebSocket (`wss://` without reverse proxy) | — | ✅ tokio-rustls, PEM certs |
+            | Radio stations (`/radio`) | — | ✅ Config-defined, DJ/CM or anyone |
+            | Blankpost toggle per area | — | ✅ `allow_blankpost` in areas.toml |
+            | Runtime area rename (`/rename`) | — | ✅ No restart needed |
+            | Panic backtrace / crash hook | — | ✅ `panic_backtrace = true` in config |
 
             ---
 
