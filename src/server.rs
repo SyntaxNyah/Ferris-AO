@@ -14,7 +14,7 @@ use crate::{
     auth::AccountManager,
     client::PairInfo,
     config::Config,
-    game::areas::Area,
+    game::{areas::Area, characters::{build_sm_packet, load_censor_words, load_lines}},
     moderation::{BanManager, IpidBanManager, WatchlistManager},
     privacy::PrivacyLayer,
     ratelimit::TokenBucket,
@@ -351,4 +351,48 @@ impl ServerState {
         let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         self.broadcast("ARUP", &refs).await;
     }
+}
+
+/// Hot-reload characters, music, backgrounds, and censor words from disk.
+///
+/// This is called by both the `/reload` command and the SIGHUP handler (Unix).
+/// Returns a human-readable summary string on success, or an error.
+pub async fn reload_game_data(state: &Arc<ServerState>) -> anyhow::Result<String> {
+    use anyhow::Context;
+    let characters = load_lines(std::path::Path::new("data/characters.txt"))
+        .context("Failed to load data/characters.txt")?;
+    let music = load_lines(std::path::Path::new("data/music.txt"))
+        .context("Failed to load data/music.txt")?;
+    let backgrounds = load_lines(std::path::Path::new("data/backgrounds.txt"))
+        .context("Failed to load data/backgrounds.txt")?;
+    let censor_words = load_censor_words(std::path::Path::new("data/censor.txt"));
+
+    // Build new SM packet using current area names.
+    let area_names: Vec<String> = {
+        let mut names = Vec::new();
+        for area_arc in &state.areas {
+            let area = area_arc.read().await;
+            names.push(area.name.clone());
+        }
+        names
+    };
+    let area_name_refs: Vec<&str> = area_names.iter().map(|s| s.as_str()).collect();
+    let sm_packet = build_sm_packet(&area_name_refs, &music);
+
+    let counts = format!(
+        "{} chars, {} music, {} backgrounds, {} censor words",
+        characters.len(),
+        music.len(),
+        backgrounds.len(),
+        censor_words.len()
+    );
+    {
+        let mut data = state.reloadable.write().await;
+        data.characters = characters;
+        data.music = music;
+        data.backgrounds = backgrounds;
+        data.sm_packet = sm_packet;
+        data.censor_words = censor_words;
+    }
+    Ok(counts)
 }

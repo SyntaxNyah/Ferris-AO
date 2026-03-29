@@ -6,7 +6,6 @@ use crate::{
     auth::accounts::perms,
     client::ClientSession,
     game::areas::{LockState, Status},
-    game::characters::{build_sm_packet, load_lines},
     protocol::packet::ao_encode,
     server::ServerState,
 };
@@ -64,6 +63,8 @@ pub async fn dispatch_command(
         "flip" => cmd_flip(session, state).await,
         "reload" => cmd_reload(session, state).await,
         "logoutall" => cmd_logoutall(session, state).await,
+        "rotatekey" => cmd_rotatekey(session, state).await,
+        "rotatesecret" => cmd_rotatesecret(session, state).await,
         _ => {
             session.server_message(&state.config.server.name, &format!("Unknown command: /{}", command));
         }
@@ -87,7 +88,9 @@ Commands:
 [MOD] /ipban <uid> [duration] <reason>  /unipban <ipid>
 [MOD] /watchlist add <hdid> [note] | /watchlist remove <hdid> | /watchlist list
 [ADMIN] /reload  — hot-reload characters/music/backgrounds
-[ADMIN] /logoutall  — force-logout all authenticated sessions";
+[ADMIN] /logoutall  — force-logout all authenticated sessions
+[ADMIN] /rotatekey  — generate a new DB key (see data/db_key_new.hex; requires restart)
+[ADMIN] /rotatesecret  — generate a new HMAC secret (set secret_rotation_enabled=true, then restart)";
     session.server_message(&state.config.server.name, msg);
 }
 
@@ -1409,48 +1412,16 @@ async fn cmd_reload(session: &mut ClientSession, state: &Arc<ServerState>) {
         session.server_message(&state.config.server.name, "No permission. Admin required.");
         return;
     }
-
-    let characters = match load_lines(std::path::Path::new("data/characters.txt")) {
-        Ok(c) => c,
-        Err(e) => { session.server_message(&state.config.server.name, &format!("Failed to load characters.txt: {}", e)); return; }
-    };
-    let music = match load_lines(std::path::Path::new("data/music.txt")) {
-        Ok(m) => m,
-        Err(e) => { session.server_message(&state.config.server.name, &format!("Failed to load music.txt: {}", e)); return; }
-    };
-    let backgrounds = match load_lines(std::path::Path::new("data/backgrounds.txt")) {
-        Ok(b) => b,
-        Err(e) => { session.server_message(&state.config.server.name, &format!("Failed to load backgrounds.txt: {}", e)); return; }
-    };
-
-    // Build new SM packet using current area names.
-    let area_names: Vec<String> = {
-        let mut names = Vec::new();
-        for area_arc in &state.areas {
-            let area = area_arc.read().await;
-            names.push(area.name.clone());
+    match crate::server::reload_game_data(state).await {
+        Ok(counts) => {
+            session.server_message(&state.config.server.name, &format!("Reloaded: {}", counts));
+            tracing::info!("Game data reloaded by {}: {}", session.mod_name.as_deref().unwrap_or("unknown"), counts);
         }
-        names
-    };
-    let area_name_refs: Vec<&str> = area_names.iter().map(|s| s.as_str()).collect();
-    let sm_packet = build_sm_packet(&area_name_refs, &music);
-
-    let censor_words = crate::game::characters::load_censor_words(std::path::Path::new("data/censor.txt"));
-    let counts = format!(
-        "{} chars, {} music, {} backgrounds, {} censor words",
-        characters.len(), music.len(), backgrounds.len(), censor_words.len()
-    );
-    {
-        let mut data = state.reloadable.write().await;
-        data.characters = characters;
-        data.music = music;
-        data.backgrounds = backgrounds;
-        data.sm_packet = sm_packet;
-        data.censor_words = censor_words;
+        Err(e) => {
+            session.server_message(&state.config.server.name, &format!("Reload failed: {}", e));
+            tracing::error!("Reload failed: {}", e);
+        }
     }
-
-    session.server_message(&state.config.server.name, &format!("Reloaded: {}", counts));
-    tracing::info!("Game data reloaded by {}: {}", session.mod_name.as_deref().unwrap_or("unknown"), counts);
 }
 
 /// /logoutall — force-logout all authenticated sessions except caller (ADMIN only).
@@ -1470,4 +1441,102 @@ async fn cmd_logoutall(session: &mut ClientSession, state: &Arc<ServerState>) {
     }
     drop(clients);
     session.server_message(&state.config.server.name, &format!("Logged out {} authenticated session(s).", count));
+}
+
+/// /rotatekey — generate a new 32-byte AES key and write it to data/db_key_new.hex (ADMIN only).
+///
+/// The new key does NOT take effect immediately.  Restart the server with
+/// `key_rotation_enabled = true` in config.toml to activate it.
+///
+/// WARNING: Activating the new key starts a FRESH database.  Back up
+/// `data/nyahao.db` before restarting.  Old data is NOT migrated automatically.
+async fn cmd_rotatekey(session: &mut ClientSession, state: &Arc<ServerState>) {
+    if !perms::has(session.permissions, perms::ADMIN) {
+        session.server_message(&state.config.server.name, "No permission. Admin required.");
+        return;
+    }
+
+    use rand::RngCore;
+    let mut new_key = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut new_key);
+    let hex_key = hex::encode(new_key);
+
+    let path = "data/db_key_new.hex";
+    match std::fs::write(path, &hex_key) {
+        Ok(_) => {
+            session.server_message(
+                &state.config.server.name,
+                "New key written to data/db_key_new.hex — restart the server to apply.\n\
+                 Set key_rotation_enabled = true in config.toml before restarting.\n\
+                 WARNING: The old database is NOT automatically migrated. Back up data/nyahao.db first.\n\
+                 Old data will NOT be accessible with the new key.",
+            );
+            tracing::info!(
+                "/rotatekey: new DB key written to {} by {}",
+                path,
+                session.mod_name.as_deref().unwrap_or("unknown")
+            );
+        }
+        Err(e) => {
+            session.server_message(
+                &state.config.server.name,
+                &format!("Failed to write {}: {}", path, e),
+            );
+            tracing::error!("/rotatekey: failed to write {}: {}", path, e);
+        }
+    }
+}
+
+/// /rotatesecret — generate a new HMAC server_secret and store it as pending (ADMIN only).
+///
+/// The pending secret is saved to the config table under "server_secret_pending".
+/// To activate it, set `secret_rotation_enabled = true` in config.toml and restart.
+///
+/// IMPORTANT: All HDID-keyed records (bans, watchlist, IPID bans) were hashed
+/// with the current secret.  After rotation those hashes will no longer match
+/// new connections.  Review and re-add any critical ban/watchlist entries after
+/// the restart.
+async fn cmd_rotatesecret(session: &mut ClientSession, state: &Arc<ServerState>) {
+    if !perms::has(session.permissions, perms::ADMIN) {
+        session.server_message(&state.config.server.name, "No permission. Admin required.");
+        return;
+    }
+
+    use rand::RngCore;
+    let mut new_secret = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut new_secret);
+
+    let db = Arc::clone(&state.db);
+    let result = tokio::task::spawn_blocking(move || {
+        db.config_set("server_secret_pending", &new_secret)
+    }).await;
+
+    match result {
+        Ok(Ok(_)) => {
+            session.server_message(
+                &state.config.server.name,
+                "Pending server_secret generated and stored in the database.\n\
+                 To apply: set `secret_rotation_enabled = true` in config.toml, then restart.\n\
+                 WARNING: After rotation, all existing HDID-keyed bans and watchlist entries \
+                 will no longer match new connections. Review them after restarting.",
+            );
+            tracing::info!(
+                "/rotatesecret: pending secret stored by {}",
+                session.mod_name.as_deref().unwrap_or("unknown")
+            );
+        }
+        Ok(Err(e)) => {
+            session.server_message(
+                &state.config.server.name,
+                &format!("Failed to store pending secret: {}", e),
+            );
+            tracing::error!("/rotatesecret: DB write failed: {}", e);
+        }
+        Err(e) => {
+            session.server_message(
+                &state.config.server.name,
+                &format!("Task error: {}", e),
+            );
+        }
+    }
 }

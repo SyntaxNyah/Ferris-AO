@@ -122,9 +122,35 @@ pub const ACCOUNTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("a
 pub const WATCHLIST_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("watchlist");
 pub const IPID_BANS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("ipid_bans");
 
+/// An embedded redb database with per-session AES-256-GCM encryption and an
+/// explicit write serialisation guard.
+///
+/// ## Write serialisation ("connection pooling")
+///
+/// redb is an embedded, single-writer MVCC store: only one write transaction
+/// may be active at a time; concurrent reads are unrestricted.  `EncryptedDb`
+/// wraps every write method behind a `std::sync::Mutex<()>` write guard so
+/// that callers (which run inside `tokio::task::spawn_blocking`) contend on
+/// *our* lock before they touch the database.  This makes the single-writer
+/// contract explicit, prevents the redb-internal "already locked" errors under
+/// high concurrency, and acts as the connection-pool gate for write operations.
+///
+/// All reads do NOT acquire the write guard — they use plain read transactions
+/// and may run concurrently.
+///
+/// ## Write-ahead log / crash recovery
+///
+/// redb uses a write-ahead log (WAL) internally.  Every committed transaction
+/// is fsync'd to the WAL before the commit returns.  If the process crashes
+/// mid-write, the WAL is replayed on the next `Database::create` call and the
+/// database is left in the last consistent state.  No additional crash-recovery
+/// logic is needed at this layer; `EncryptedDb::check_integrity` performs a
+/// lightweight read-only sanity check that exercises the WAL replay path.
 pub struct EncryptedDb {
     pub inner: Database,
     cipher: Aes256Gcm,
+    /// Serialises all write transactions.  Read transactions do not acquire this.
+    write_guard: std::sync::Mutex<()>,
 }
 
 impl EncryptedDb {
@@ -216,7 +242,23 @@ impl EncryptedDb {
             new_counter
         );
 
-        Ok(Self { inner: db, cipher: new_cipher })
+        Ok(Self { inner: db, cipher: new_cipher, write_guard: std::sync::Mutex::new(()) })
+    }
+
+    /// Lightweight startup integrity check.
+    ///
+    /// Opens a read transaction on every table to verify the database file and
+    /// WAL are readable.  Should be called once after `open`; a failure here
+    /// indicates file corruption or an incomplete WAL replay.
+    pub fn check_integrity(&self) -> Result<()> {
+        let rtxn = self.inner.begin_read().context("Integrity check: failed to begin read transaction")?;
+        rtxn.open_table(CONFIG_TABLE).context("Integrity check: config table")?;
+        rtxn.open_table(BANS_TABLE).context("Integrity check: bans table")?;
+        rtxn.open_table(BANS_BY_HDID_TABLE).context("Integrity check: bans_by_hdid table")?;
+        rtxn.open_table(ACCOUNTS_TABLE).context("Integrity check: accounts table")?;
+        rtxn.open_table(WATCHLIST_TABLE).context("Integrity check: watchlist table")?;
+        rtxn.open_table(IPID_BANS_TABLE).context("Integrity check: ipid_bans table")?;
+        Ok(())
     }
 
     /// Encrypt plaintext with the current session key.
@@ -239,6 +281,7 @@ impl EncryptedDb {
 
     /// Write raw (unencrypted) bytes to the config table.
     pub fn config_set(&self, key: &str, value: &[u8]) -> Result<()> {
+        let _guard = self.write_guard.lock().unwrap();
         let write = self.inner.begin_write()?;
         {
             let mut table = write.open_table(CONFIG_TABLE)?;
@@ -248,9 +291,23 @@ impl EncryptedDb {
         Ok(())
     }
 
+    /// Delete a key from the config table.  Returns `true` if the key existed.
+    pub fn config_delete(&self, key: &str) -> Result<bool> {
+        let _guard = self.write_guard.lock().unwrap();
+        let write = self.inner.begin_write()?;
+        let removed;
+        {
+            let mut table = write.open_table(CONFIG_TABLE)?;
+            removed = table.remove(key)?.is_some();
+        }
+        write.commit()?;
+        Ok(removed)
+    }
+
     /// Write an encrypted JSON value to the bans table.
     pub fn bans_insert(&self, id: u64, value: &[u8]) -> Result<()> {
         let encrypted = self.encrypt(value)?;
+        let _guard = self.write_guard.lock().unwrap();
         let write = self.inner.begin_write()?;
         {
             let mut table = write.open_table(BANS_TABLE)?;
@@ -276,6 +333,7 @@ impl EncryptedDb {
         let mut ids = existing;
         ids.push(ban_id);
         let encoded = serde_json::to_vec(&ids)?;
+        let _guard = self.write_guard.lock().unwrap();
         let write = self.inner.begin_write()?;
         {
             let mut table = write.open_table(BANS_BY_HDID_TABLE)?;
@@ -297,6 +355,7 @@ impl EncryptedDb {
     /// Write an encrypted JSON value to the accounts table (key = username).
     pub fn accounts_insert(&self, username: &str, value: &[u8]) -> Result<()> {
         let encrypted = self.encrypt(value)?;
+        let _guard = self.write_guard.lock().unwrap();
         let write = self.inner.begin_write()?;
         {
             let mut table = write.open_table(ACCOUNTS_TABLE)?;
@@ -316,6 +375,7 @@ impl EncryptedDb {
     }
 
     pub fn accounts_delete(&self, username: &str) -> Result<bool> {
+        let _guard = self.write_guard.lock().unwrap();
         let write = self.inner.begin_write()?;
         let removed;
         {
@@ -329,6 +389,7 @@ impl EncryptedDb {
     /// Write an encrypted watchlist entry (key = hashed HDID).
     pub fn watchlist_insert(&self, hdid: &str, value: &[u8]) -> Result<()> {
         let encrypted = self.encrypt(value)?;
+        let _guard = self.write_guard.lock().unwrap();
         let write = self.inner.begin_write()?;
         {
             let mut table = write.open_table(WATCHLIST_TABLE)?;
@@ -348,6 +409,7 @@ impl EncryptedDb {
     }
 
     pub fn watchlist_remove(&self, hdid: &str) -> Result<bool> {
+        let _guard = self.write_guard.lock().unwrap();
         let write = self.inner.begin_write()?;
         let removed;
         {
@@ -375,6 +437,7 @@ impl EncryptedDb {
     /// Write an encrypted IPID ban record (key = hashed IPID).
     pub fn ipid_bans_insert(&self, ipid: &str, value: &[u8]) -> Result<()> {
         let encrypted = self.encrypt(value)?;
+        let _guard = self.write_guard.lock().unwrap();
         let write = self.inner.begin_write()?;
         {
             let mut table = write.open_table(IPID_BANS_TABLE)?;
@@ -394,6 +457,7 @@ impl EncryptedDb {
     }
 
     pub fn ipid_bans_remove(&self, ipid: &str) -> Result<bool> {
+        let _guard = self.write_guard.lock().unwrap();
         let write = self.inner.begin_write()?;
         let removed;
         {

@@ -14,6 +14,8 @@ pub struct Config {
     pub rate_limits: RateLimitsConfig,
     #[serde(default)]
     pub censor: CensorConfig,
+    #[serde(default)]
+    pub cluster: GossipConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,6 +39,56 @@ pub struct ServerConfig {
     /// it to shed slow consumers sooner.  Default: 256.
     #[serde(default = "default_outbound_queue_cap")]
     pub outbound_queue_cap: usize,
+
+    /// When true, applies a pending server_secret rotation on next startup.
+    ///
+    /// Workflow:
+    ///   1. In-game admin runs `/rotatesecret`; this writes a new secret to
+    ///      the config table under the key "server_secret_pending".
+    ///   2. Set `secret_rotation_enabled = true` in config.toml and restart.
+    ///   3. On startup, the pending secret replaces the active one.
+    ///
+    /// IMPORTANT: HDID-keyed records (bans, watchlist) were derived from the
+    /// old secret.  They remain in the database but will never match future
+    /// connections.  Review and re-add any critical entries after rotation.
+    ///
+    /// Default: false.
+    #[serde(default)]
+    pub secret_rotation_enabled: bool,
+
+    /// When true, the server will look for `data/db_key_new.hex` on startup.
+    /// If found, it is used as the new DB key and renamed to `data/db_key_active.hex`.
+    /// NOTE: This starts a fresh database — back up your old db before enabling.
+    /// Default: false.
+    #[serde(default)]
+    pub key_rotation_enabled: bool,
+
+    /// Argon2id memory cost in KiB.  Default: 65536 (64 MiB).
+    #[serde(default = "default_argon2_memory")]
+    pub argon2_memory_kib: u32,
+
+    /// Argon2id iteration count.  Default: 3.
+    #[serde(default = "default_argon2_iterations")]
+    pub argon2_iterations: u32,
+
+    /// Argon2id parallelism (thread count).  Default: 2.
+    #[serde(default = "default_argon2_parallelism")]
+    pub argon2_parallelism: u32,
+
+    /// When > 0, outbound packets are batched up to this many before flushing.
+    /// 0 = disabled (flush every packet immediately).  Default: 0.
+    #[serde(default)]
+    pub packet_batch_size: usize,
+
+    /// Milliseconds to wait before force-flushing a partial batch.
+    /// Only used when packet_batch_size > 0.  Default: 5.
+    #[serde(default = "default_packet_batch_interval_ms")]
+    pub packet_batch_interval_ms: u64,
+
+    /// Enable binary (MessagePack) protocol.  Default: false.
+    /// Clients opt-in by sending `BINARY#1#%` as their first message.
+    #[serde(default)]
+    pub binary_protocol: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,6 +113,14 @@ pub struct NetworkConfig {
     /// considered stale and disconnected. 0 disables timeout.
     #[serde(default = "default_ws_ping_timeout")]
     pub ws_ping_timeout_secs: u64,
+
+    /// Enable WebSocket permessage-deflate compression.  Default: false.
+    /// NOTE: Requires tungstenite >= 0.20 with the `permessage-deflate` feature.
+    /// The current tungstenite 0.26 crate does not expose WebSocketConfig::compression;
+    /// this field is reserved for future use.
+    /// TODO: Enable when tungstenite exposes permessage-deflate in WebSocketConfig.
+    #[serde(default)]
+    pub ws_compression: bool,
 }
 
 fn default_http_port() -> u16 { 80 }
@@ -69,6 +129,10 @@ fn default_ws_ping_interval() -> u64 { 30 }
 fn default_ws_ping_timeout() -> u64 { 90 }
 fn default_max_packet_bytes() -> usize { 8192 }
 fn default_outbound_queue_cap() -> usize { 256 }
+fn default_argon2_memory() -> u32 { 65536 }
+fn default_argon2_iterations() -> u32 { 3 }
+fn default_argon2_parallelism() -> u32 { 2 }
+fn default_packet_batch_interval_ms() -> u64 { 5 }
 
 #[derive(Debug, Deserialize)]
 pub struct PrivacyConfig {
@@ -197,6 +261,46 @@ impl Default for RateLimitsConfig {
             zz_cooldown_secs: default_zz_cooldown(),
             conn_rate: default_conn_rate(),
             conn_burst: default_conn_burst(),
+        }
+    }
+}
+
+/// Cluster / gossip configuration.  All fields default to disabled/empty so
+/// existing deployments without a `[cluster]` section are unaffected.
+#[derive(Debug, Deserialize, Clone)]
+pub struct GossipConfig {
+    /// Enable the gossip protocol.  Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Unique identifier for this node.  Default: empty (auto-assigned at startup).
+    #[serde(default)]
+    pub node_id: String,
+
+    /// Peer addresses to gossip with (host:port).  Default: empty.
+    #[serde(default)]
+    pub peers: Vec<String>,
+
+    /// UDP port to listen on for incoming gossip messages.  Default: 27019.
+    #[serde(default = "default_gossip_port")]
+    pub gossip_port: u16,
+
+    /// Number of virtual nodes per real node in the consistent-hash ring.  Default: 150.
+    #[serde(default = "default_hash_replicas")]
+    pub hash_replicas: usize,
+}
+
+fn default_gossip_port() -> u16 { 27019 }
+fn default_hash_replicas() -> usize { 150 }
+
+impl Default for GossipConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            node_id: String::new(),
+            peers: Vec::new(),
+            gossip_port: default_gossip_port(),
+            hash_replicas: default_hash_replicas(),
         }
     }
 }

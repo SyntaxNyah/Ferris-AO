@@ -1,4 +1,5 @@
 use std::time::{Duration, Instant};
+use base64::Engine as _;
 use tokio::sync::mpsc::{self, Sender};
 
 use crate::ratelimit::TokenBucket;
@@ -101,6 +102,10 @@ pub struct ClientSession {
 
     // Outbound message sender (bounded — provides backpressure against slow clients).
     pub tx: Sender<String>,
+
+    /// When true the client has opted into the MessagePack binary protocol
+    /// (negotiated via the `BINARY#1#%` handshake message).
+    pub use_binary: bool,
 }
 
 impl ClientSession {
@@ -138,6 +143,7 @@ impl ClientSession {
             last_zz: None,
             zz_cooldown: Duration::from_secs(rl.zz_cooldown_secs),
             tx,
+            use_binary: false,
         }
     }
 
@@ -149,7 +155,32 @@ impl ClientSession {
     }
 
     /// Send a packet.
+    ///
+    /// When `use_binary = true` the packet is encoded as a MessagePack array
+    /// `[header, field1, field2, …]` and base64-encoded so it can be transported
+    /// over the existing `String` outbound channel as `BINPKT:<base64>\n`.
+    /// The recipient decodes from base64 then from MessagePack.
+    /// When `use_binary = false` (or when `rmp-serde` is unavailable), the
+    /// standard AO2 text encoding is used.
     pub fn send_packet(&self, header: &str, args: &[&str]) {
+        if self.use_binary {
+            // Encode as MessagePack array: [header, arg0, arg1, ...]
+            let mut fields: Vec<&str> = Vec::with_capacity(1 + args.len());
+            fields.push(header);
+            fields.extend_from_slice(args);
+            match rmp_serde::to_vec(&fields) {
+                Ok(bytes) => {
+                    // Transmit as a special framed string so the outbound writer
+                    // can send it as a WebSocket Binary frame.
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    self.send_raw(format!("BINPKT:{}\n", b64));
+                    return;
+                }
+                Err(_) => {
+                    // Fall through to text encoding on serialisation failure.
+                }
+            }
+        }
         let msg = if args.is_empty() {
             format!("{}#%", header)
         } else {

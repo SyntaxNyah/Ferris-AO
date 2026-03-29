@@ -44,6 +44,12 @@ impl WsTransport {
         Ok(())
     }
 
+    /// Send raw binary data as a WebSocket Binary frame (for MessagePack payloads).
+    pub async fn send_binary(&mut self, data: &[u8]) -> Result<()> {
+        self.ws.send(Message::Binary(data.to_vec().into())).await?;
+        Ok(())
+    }
+
     /// Send a WebSocket Ping frame for keepalive.
     pub async fn send_ping(&mut self) -> Result<()> {
         self.ws.send(Message::Ping(vec![].into())).await?;
@@ -146,9 +152,11 @@ async fn accept_ws(
     // excessive buffering.
     //
     // NOTE: permessage-deflate (RFC 7692) compression is not yet available in
-    // tungstenite 0.26.  When we upgrade to a version that exposes
+    // tungstenite 0.26.  The `network.ws_compression` config field is reserved
+    // for future use.  When we upgrade to a version that exposes
     // WebSocketConfig::compression, enable it here with DeflateConfig::default()
-    // — supporting clients will negotiate it automatically; others fall back.
+    // when `state.config.network.ws_compression = true`.
+    // TODO: Enable when tungstenite exposes permessage-deflate in WebSocketConfig.
     let ws_config = WebSocketConfig::default()
         .write_buffer_size(128 * 1024)
         .max_write_buffer_size(256 * 1024);

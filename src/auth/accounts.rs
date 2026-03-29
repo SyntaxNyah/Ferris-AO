@@ -1,7 +1,7 @@
 use anyhow::Result;
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
-    Argon2,
+    Algorithm, Argon2, Params, Version,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -63,10 +63,27 @@ impl AccountManager {
         Self { db }
     }
 
-    /// Hash a password with Argon2id. This is CPU-intensive; call via spawn_blocking.
+    /// Hash a password with Argon2id using default parameters.
+    /// This is CPU-intensive; call via spawn_blocking.
     pub fn hash_password(password: &str) -> Result<String> {
+        Self::hash_password_with_params(password, 65536, 3, 2)
+    }
+
+    /// Hash a password with Argon2id using explicit parameters.
+    /// - `memory_kib`: memory cost in KiB (e.g. 65536 = 64 MiB)
+    /// - `iterations`: time cost (passes)
+    /// - `parallelism`: number of threads
+    /// This is CPU-intensive; call via spawn_blocking.
+    pub fn hash_password_with_params(
+        password: &str,
+        memory_kib: u32,
+        iterations: u32,
+        parallelism: u32,
+    ) -> Result<String> {
         let salt = SaltString::generate(&mut OsRng);
-        let argon2 = Argon2::default();
+        let params = Params::new(memory_kib, iterations, parallelism, None)
+            .map_err(|e| anyhow::anyhow!("Invalid Argon2 params: {}", e))?;
+        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
         let hash = argon2
             .hash_password(password.as_bytes(), &salt)
             .map_err(|e| anyhow::anyhow!("Password hashing failed: {}", e))?
@@ -86,7 +103,20 @@ impl AccountManager {
     }
 
     pub fn create(&self, username: &str, password: &str, role: &str) -> Result<()> {
-        let hash = Self::hash_password(password)?;
+        self.create_with_params(username, password, role, 65536, 3, 2)
+    }
+
+    /// Create an account using explicit Argon2id parameters.
+    pub fn create_with_params(
+        &self,
+        username: &str,
+        password: &str,
+        role: &str,
+        memory_kib: u32,
+        iterations: u32,
+        parallelism: u32,
+    ) -> Result<()> {
+        let hash = Self::hash_password_with_params(password, memory_kib, iterations, parallelism)?;
         let account = Account {
             username: username.to_lowercase(),
             password_hash: hash,

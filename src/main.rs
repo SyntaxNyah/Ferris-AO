@@ -1,5 +1,6 @@
 mod auth;
 mod client;
+mod cluster;
 mod commands;
 mod config;
 mod game;
@@ -38,8 +39,14 @@ async fn main() -> Result<()> {
     let config = Config::load(config_path).context("Failed to load config.toml")?;
 
     // ── Init tracing ───────────────────────────────────────────────────────────
+    // "minimal" is a convenience preset that maps to "warn" (warnings + errors only).
+    let effective_log_level = if config.logging.log_level == "minimal" {
+        "warn"
+    } else {
+        &config.logging.log_level
+    };
     let filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new(&config.logging.log_level))
+        .or_else(|_| EnvFilter::try_new(effective_log_level))
         .unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -59,8 +66,31 @@ async fn main() -> Result<()> {
     }
 
     // ── Determine AES-256 key for the DB ───────────────────────────────────────
+    // Key selection priority (highest to lowest):
+    //   1. data/db_key_new.hex  (key rotation — only when key_rotation_enabled = true)
+    //   2. NYAHAO_DB_KEY env var
+    //   3. Insecure default dev key
+    std::fs::create_dir_all("data").ok();
     let db_key: [u8; 32] = {
-        if let Ok(hex_key) = std::env::var("NYAHAO_DB_KEY") {
+        // Check for pending key rotation file.
+        let new_key_path = std::path::Path::new("data/db_key_new.hex");
+        let active_key_path = std::path::Path::new("data/db_key_active.hex");
+        if config.server.key_rotation_enabled && new_key_path.exists() {
+            let hex_content = std::fs::read_to_string(new_key_path)
+                .context("Failed to read data/db_key_new.hex")?;
+            let bytes = hex::decode(hex_content.trim())
+                .context("data/db_key_new.hex must contain a 64-char hex string (32 bytes)")?;
+            if bytes.len() != 32 {
+                anyhow::bail!("data/db_key_new.hex must decode to exactly 32 bytes");
+            }
+            // Promote new key to active and remove the pending file.
+            std::fs::rename(new_key_path, active_key_path)
+                .context("Failed to rename db_key_new.hex to db_key_active.hex")?;
+            info!("Key rotation: loaded new key from data/db_key_new.hex (now data/db_key_active.hex). NOTE: This starts a fresh DB with the new key — old data is NOT migrated automatically.");
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            arr
+        } else if let Ok(hex_key) = std::env::var("NYAHAO_DB_KEY") {
             let bytes = hex::decode(hex_key.trim())
                 .context("NYAHAO_DB_KEY must be a 64-char hex string (32 bytes)")?;
             if bytes.len() != 32 {
@@ -77,26 +107,47 @@ async fn main() -> Result<()> {
     };
 
     // ── Open encrypted database ────────────────────────────────────────────────
-    std::fs::create_dir_all("data").ok();
     let db = Arc::new(
         EncryptedDb::open("data/nyahao.db", &db_key).context("Failed to open database")?,
     );
 
+    // ── Startup DB integrity check (WAL replay verification) ──────────────────
+    db.check_integrity().context(
+        "Database integrity check failed — the file may be corrupt or incomplete. \
+         Restore from a backup or delete data/nyahao.db to start fresh."
+    )?;
+    info!("Database integrity OK.");
+
     // ── Load or generate server secret (for privacy hashing) ──────────────────
+    // Secret rotation: if `secret_rotation_enabled = true` and a pending
+    // secret was generated via `/rotatesecret`, promote it to active now.
+    // HDID-keyed records derived from the old secret will no longer match —
+    // the admin must review bans/watchlist after rotation.
     let server_secret: [u8; 32] = {
-        let stored = db.config_get("server_secret")?;
-        if let Some(bytes) = stored {
-            if bytes.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                arr
+        if config.server.secret_rotation_enabled {
+            if let Some(pending) = db.config_get("server_secret_pending")? {
+                if pending.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&pending);
+                    db.config_set("server_secret", &arr)
+                        .context("Failed to apply pending server_secret")?;
+                    db.config_delete("server_secret_pending")
+                        .context("Failed to clear server_secret_pending")?;
+                    warn!(
+                        "Secret rotation applied. All HDID-keyed records (bans, watchlist, \
+                         IPID bans) were derived from the old secret and will no longer match \
+                         new connections. Review and re-add any critical entries."
+                    );
+                    arr
+                } else {
+                    warn!("server_secret_pending has wrong length; ignoring.");
+                    load_or_generate_secret(&db)?
+                }
             } else {
-                warn!("Stored server_secret has wrong length; regenerating.");
-                generate_and_store_secret(&db)?
+                load_or_generate_secret(&db)?
             }
         } else {
-            info!("No server_secret found — generating new one.");
-            generate_and_store_secret(&db)?
+            load_or_generate_secret(&db)?
         }
     };
     let privacy = PrivacyLayer::new(server_secret);
@@ -195,6 +246,61 @@ async fn main() -> Result<()> {
         run_stdin_cli(cli_state, cli_shutdown_tx).await;
     });
 
+    // ── SIGHUP handler for zero-downtime config reload (Unix only) ─────────────
+    #[cfg(unix)]
+    {
+        let sighup_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sighup = signal(SignalKind::hangup()).expect("failed to register SIGHUP");
+            loop {
+                sighup.recv().await;
+                info!("SIGHUP received — reloading game data…");
+                match crate::server::reload_game_data(&sighup_state).await {
+                    Ok(counts) => info!("SIGHUP reload complete: {}", counts),
+                    Err(e) => error!("SIGHUP reload failed: {}", e),
+                }
+            }
+        });
+    }
+
+    // ── SIGUSR1 handler for graceful restart (Unix only) ──────────────────────
+    // SIGUSR1 broadcasts a 10-second countdown to all connected clients, then
+    // triggers the normal shutdown path.  The process manager (systemd, etc.)
+    // is responsible for starting the new process after exit.
+    #[cfg(unix)]
+    {
+        let sigusr1_state = Arc::clone(&state);
+        let sigusr1_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigusr1 = signal(SignalKind::user_defined1())
+                .expect("failed to register SIGUSR1");
+            loop {
+                sigusr1.recv().await;
+                info!("SIGUSR1 received — graceful restart initiated (10 s drain)");
+                sigusr1_state
+                    .broadcast("CT", &["Server", "Server is restarting in 10 seconds. Please stand by.", "1"])
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                sigusr1_state
+                    .broadcast("CT", &["Server", "Server is restarting now. Reconnect shortly.", "1"])
+                    .await;
+                let _ = sigusr1_shutdown.send(());
+                break;
+            }
+        });
+    }
+
+    // ── Start cluster gossip (if enabled) ─────────────────────────────────────
+    {
+        let cluster_state = Arc::clone(&state);
+        let cluster_cfg = state.config.cluster.clone();
+        tokio::spawn(async move {
+            cluster::start_cluster(cluster_cfg, cluster_state).await;
+        });
+    }
+
     // ── Wait for Ctrl-C or shutdown ────────────────────────────────────────────
     tokio::signal::ctrl_c().await.ok();
     info!("Shutting down…");
@@ -209,8 +315,19 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Generate a random 32-byte server secret and persist it in the DB.
-fn generate_and_store_secret(db: &EncryptedDb) -> Result<[u8; 32]> {
+/// Load the server secret from the DB, or generate and persist a new one.
+fn load_or_generate_secret(db: &EncryptedDb) -> Result<[u8; 32]> {
+    let stored = db.config_get("server_secret")?;
+    if let Some(bytes) = stored {
+        if bytes.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            return Ok(arr);
+        }
+        warn!("Stored server_secret has wrong length; regenerating.");
+    } else {
+        info!("No server_secret found — generating new one.");
+    }
     use rand::RngCore;
     let mut secret = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut secret);
@@ -278,7 +395,12 @@ async fn run_stdin_cli(state: Arc<ServerState>, shutdown_tx: broadcast::Sender<(
                 let u = arg1.clone();
                 let p = pw.clone();
                 let r = role.clone();
-                match tokio::task::spawn_blocking(move || accounts.create(&u, &p, &r)).await {
+                let a2_mem = state.config.server.argon2_memory_kib;
+                let a2_iter = state.config.server.argon2_iterations;
+                let a2_par = state.config.server.argon2_parallelism;
+                match tokio::task::spawn_blocking(move || {
+                    accounts.create_with_params(&u, &p, &r, a2_mem, a2_iter, a2_par)
+                }).await {
                     Ok(Ok(_)) => println!("[CLI] Created user '{}' with role '{}'.", arg1, role),
                     Ok(Err(e)) => println!("[CLI] Error: {}", e),
                     Err(e) => println!("[CLI] Task error: {}", e),

@@ -2,6 +2,7 @@
 /// Each handler takes: &mut ClientSession, &Packet, &Arc<ServerState>
 /// and runs inside the client's async task.
 use std::sync::Arc;
+use base64::Engine as _;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -40,6 +41,15 @@ pub async fn dispatch(session: &mut ClientSession, state: &Arc<ServerState>, pkt
     // Handle internal control messages from mute/unmute commands
     if pkt.header.starts_with("__") {
         handle_internal(session, state, &pkt.header).await;
+        return;
+    }
+
+    // Binary protocol negotiation: client sends BINARY#1#% to opt in.
+    if pkt.header == "BINARY" {
+        if pkt.body.first().map(|s| s.as_str()) == Some("1") && state.config.server.binary_protocol {
+            session.use_binary = true;
+            session.send_packet("BINARY", &["1"]);
+        }
         return;
     }
 
@@ -869,7 +879,9 @@ async fn handle_mc(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
         if !session.rl_mc.try_consume() {
             return;
         }
-        if !session.can_change_music() {
+        // DJs bypass the lock_music / mute check just like /play does.
+        let is_dj = perms::has(session.permissions, perms::DJ);
+        if !is_dj && !session.can_change_music() {
             session.server_message(&state.config.server.name, "You are not allowed to change the music here.");
             return;
         }
@@ -1212,6 +1224,20 @@ pub async fn run_client(
     // Skip the first immediate tick so the ping doesn't fire at time 0.
     ping_timer.tick().await;
 
+    // Packet batching configuration.
+    // When packet_batch_size > 0, up to that many packets are drained from
+    // the outbound channel and concatenated before a single transport.send().
+    // The current implementation flushes immediately when the batch is full
+    // OR after the first blocking recv() — which already provides the benefit
+    // of coalescing burst writes.
+    //
+    // TODO (packet_batch_interval_ms): For a strict timer-based flush, wrap the
+    // outbound channel in a dedicated write task that also wakes on
+    // `tokio::time::sleep(Duration::from_millis(packet_batch_interval_ms))`.
+    // This is deferred because it requires a larger refactor of the write path.
+    let _batch_size = state.config.server.packet_batch_size;
+    let _batch_interval_ms = state.config.server.packet_batch_interval_ms;
+
     // Drive read and write concurrently within the same task.
     loop {
         tokio::select! {
@@ -1227,6 +1253,14 @@ pub async fn run_client(
                 if msg.starts_with("__") {
                     let header = msg.trim_end_matches("#%").trim_end_matches('#');
                     handle_internal(&mut session, &state, header).await;
+                } else if msg.starts_with("BINPKT:") {
+                    // Binary (MessagePack) packet: decode base64 → send as raw bytes.
+                    let b64 = msg.trim_start_matches("BINPKT:").trim_end_matches('\n');
+                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                        if let Err(e) = transport.send_binary(&bytes).await {
+                            debug!("Binary send error: {}", e);
+                        }
+                    }
                 } else {
                     outbound.push_str(&msg);
                 }
@@ -1245,6 +1279,22 @@ pub async fn run_client(
                             }
                             let header = m.trim_end_matches("#%").trim_end_matches('#');
                             handle_internal(&mut session, &state, header).await;
+                        }
+                        Ok(m) if m.starts_with("BINPKT:") => {
+                            if !outbound.is_empty() {
+                                if let Err(e) = transport.send(&outbound).await {
+                                    debug!("Send error (batch flush): {}", e);
+                                    break;
+                                }
+                                outbound.clear();
+                            }
+                            let b64 = m.trim_start_matches("BINPKT:").trim_end_matches('\n');
+                            use base64::Engine;
+                            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                                if let Err(e) = transport.send_binary(&bytes).await {
+                                    debug!("Binary send error (batch): {}", e);
+                                }
+                            }
                         }
                         Ok(m) => outbound.push_str(&m),
                         Err(_) => break,

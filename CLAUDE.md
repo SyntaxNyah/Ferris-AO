@@ -110,12 +110,13 @@ pub struct ServerState {
     pub watchlist: WatchlistManager,
     pub player_watch_tx: watch::Sender<usize>,     // Triggers master server re-advertise
     pub conn_limiters: Mutex<HashMap<IpAddr, TokenBucket>>, // Per-IP connection rate
+    pub last_arup: Mutex<ArupSnapshot>,                    // Delta suppression cache
 }
 ```
 
 ### ClientHandle vs ClientSession
 
-- **`ClientHandle`** (in `ServerState.clients`) — the small, shared-read view of a connection. Holds the `mpsc::UnboundedSender<String>` used to push outgoing messages to the connection's write task.
+- **`ClientHandle`** (in `ServerState.clients`) — the small, shared-read view of a connection. Holds the `mpsc::Sender<String>` (bounded channel, capacity = `outbound_queue_cap`) used to push outgoing messages to the connection's write task.
 - **`ClientSession`** (local to connection task) — full mutable per-connection state: rate limiters, mute state, pairing, PM history, case prefs, narrator mode, etc.
 
 When a handler needs to send a packet to *another* client, it looks up `clients.get(&uid).tx.send(...)`. For the *current* client it calls `transport.send(...)` directly.
@@ -201,7 +202,9 @@ pub struct Packet {
 | `/status <s>` | Set area status (`idle`, `rp`, `casing`, `looking-for-players`, `recess`, `gaming`) |
 | `/lock [-s]` | Lock area; `-s` = spectatable mode (requires BYPASS_LOCK or CM) |
 | `/unlock` | Unlock area |
-| `/play <song>` | Change music (if area.lock_music = false, or has MODIFY_AREA) |
+| `/play <song or URL>` | Play a music file or stream an http(s):// URL. Requires in-area CM, PERM_CM, or PERM_DJ. |
+| `/roll [NdM]` | Roll dice and broadcast result. Default `1d6`. Max 20 dice, sides 2–10000. |
+| `/flip` | Flip a coin (Heads/Tails) and broadcast result. |
 | `/login <u> <p>` | Authenticate; runs Argon2id verify in `spawn_blocking` |
 | `/logout` | Deauthenticate |
 | `/pair <uid>` | Request pairing with another player |
@@ -254,14 +257,16 @@ pub const PERM_MOD_CHAT:     u64 = 512;
 pub const PERM_MUTE:         u64 = 1024;
 pub const PERM_LOG:          u64 = 2048;
 pub const PERM_WATCHLIST:    u64 = 4096;
+pub const PERM_DJ:           u64 = 1 << 13;  // play music / stream URLs in any area
 pub const PERM_ADMIN:        u64 = u64::MAX;
 ```
 
 **Role mappings** (used by `mkusr`/`setrole`):
 - `admin` → `PERM_ADMIN`
-- `mod` / `moderator` → everything except CM
+- `mod` / `moderator` → everything except CM and DJ
 - `trial` → `KICK | MOD_CHAT | MUTE`
-- `cm` → `CM | BYPASS_LOCK | MOD_EVI`
+- `cm` → `CM`
+- `dj` → `DJ` — can use `/play` (songs + URLs) in any area regardless of CM status
 - `none` → `0`
 
 Check: `session.permissions & PERM_KICK != 0`
@@ -288,6 +293,7 @@ Config {
 **ServerConfig** key fields:
 - `name`, `description`, `motd`, `max_players`, `max_message_len`, `asset_url`, `multiclient_limit`
 - `max_packet_bytes` (default: 8192) — hard drop before parsing
+- `outbound_queue_cap` (default: 256) — max packets queued per client; excess silently dropped (backpressure)
 
 **NetworkConfig** key fields:
 - `tcp_port` (27017), `ws_port` (27018), `bind_addr`
@@ -348,11 +354,13 @@ pub struct Area {
 
 ### ARUP packets
 
-`ServerState::broadcast_arup()` sends four `ARUP` packets to all clients after any area state change:
-- `ARUP#0#...` — player counts
-- `ARUP#1#...` — statuses
-- `ARUP#2#...` — CM names
-- `ARUP#3#...` — lock states
+`ServerState` exposes four dedicated methods that each send one `ARUP` type to all clients:
+- `send_player_arup()` → `ARUP#0#...` — player counts
+- `send_status_arup()` → `ARUP#1#...` — statuses
+- `send_cm_arup()` → `ARUP#2#...` — CM labels
+- `send_lock_arup()` → `ARUP#3#...` — lock states
+
+Each method has **delta suppression**: it compares the current values against the `ArupSnapshot` cached in `ServerState.last_arup`. If nothing changed, the broadcast is skipped entirely (no socket writes, no client-list walk). The snapshot is updated atomically before broadcasting. Call the specific method(s) after the field(s) you changed; do not call all four indiscriminately.
 
 ---
 
@@ -414,11 +422,14 @@ Wraps [redb](https://github.com/cberner/redb) (embedded MVCC key-value). Encrypt
 
 ### WebSocket (network/websocket.rs)
 
-- HTTP upgrade via `tokio_tungstenite::accept_hdr_async`
+- HTTP upgrade via `tokio_tungstenite::accept_hdr_async_with_config` (passes a `WebSocketConfig`)
 - When `reverse_proxy_mode = true`: reads `X-Forwarded-For` (first address) or `X-Real-IP` from request headers
 - Ping/Pong keepalive: spawns a separate interval task that calls `transport.send_ping()` at `ws_ping_interval_secs`; stale detection via `last_pong` timestamp
 - `Message::Text` uses `Utf8Bytes` (tungstenite 0.26 breaking change — use `.into()`)
 - `Message::Ping` uses `Bytes` (tungstenite 0.26 — use `vec![].into()`)
+- **Write-buffer tuning:** `WebSocketConfig::default().write_buffer_size(128 * 1024).max_write_buffer_size(256 * 1024)` — accommodates multi-packet bursts without excessive buffering
+- **`WebSocketConfig` is `#[non_exhaustive]`:** cannot use struct literal + `..Default::default()`. Must use the builder method chain shown above.
+- **permessage-deflate (TODO):** tungstenite 0.26 does not expose a compression API. When upgrading to a version that does, add `DeflateConfig::default()` to the config — clients negotiate it automatically, others fall back. A TODO comment marks the spot in `accept_ws`.
 
 ### AoTransport enum (network/mod.rs)
 
@@ -659,10 +670,14 @@ r.backgrounds = load_lines("data/backgrounds.txt")?;
 
 ### ARUP after area mutation
 
-After any change to area player count, status, CMs, or lock state, always call:
+After any change to area state, call the specific ARUP method(s) for what changed:
 ```rust
-state.broadcast_arup().await;
+state.send_player_arup().await;   // after players join/leave
+state.send_status_arup().await;   // after /status
+state.send_cm_arup().await;       // after /cm or /uncm
+state.send_lock_arup().await;     // after /lock or /unlock
 ```
+Delta suppression means calling these when nothing changed is cheap (early return after snapshot comparison). But prefer calling only what you changed to keep the code self-documenting.
 
 ---
 
@@ -760,3 +775,91 @@ One background folder name per line.
     [28]      ADDITIVE     ← client [24]
     [29]      EFFECTS      ← client [25]   ← must be present for WebAO
     ```
+
+13. **ThreadRng is `!Send`:** `rand::thread_rng()` returns `ThreadRng` which cannot be held across `.await` points (makes the future `!Send`, causing `tokio::spawn` to reject it). Always scope all RNG calls in a synchronous block so the rng is dropped before any await:
+    ```rust
+    let rolls: Vec<u32> = {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        (0..count).map(|_| rng.gen_range(1..=sides)).collect()
+    };
+    // rng dropped here — safe to .await below
+    ```
+
+14. **HMAC `new_from_slice` ambiguity:** `<Hmac<Sha256>>::new_from_slice` is ambiguous because both the `KeyInit` and `Mac` traits expose it. Use fully-qualified syntax: `<Hmac<Sha256> as hmac::Mac>::new_from_slice(key).unwrap()`.
+
+15. **Bounded outbound channel:** `ClientHandle.tx` and `ClientSession.tx` are `mpsc::Sender<String>` (bounded, capacity from `outbound_queue_cap`). Always use `try_send` — never `send().await`. A full channel means the client is too slow; silently dropping is intentional backpressure.
+
+---
+
+## Key Rotation System (storage/db.rs)
+
+Every server startup re-encrypts all sensitive DB tables under a fresh derived key. This prevents an attacker who obtains a snapshot of the DB file from recovering data with a previously-leaked key.
+
+### How it works
+
+1. A `KEY_ROTATION_COUNTER` (u64) is stored **unencrypted** in `CONFIG_TABLE`.
+2. On `EncryptedDb::open`, the current counter is read:
+   - **First run** (`counter` absent): use the raw `master_key` as the old cipher (backward compat with DBs created before rotation was added). Set `new_counter = 1`.
+   - **Subsequent runs**: `old_counter = counter`, `new_counter = old_counter + 1`.
+3. Two session keys are derived:
+   ```rust
+   fn derive_session_key(master: &[u8; 32], counter: u64) -> [u8; 32] {
+       // HMAC-SHA256(master_key, "nyahao-session-{counter:016x}")
+   }
+   ```
+4. All encrypted tables (`BANS`, `ACCOUNTS`, `WATCHLIST`, `IPID_BANS`) are re-encrypted:
+   - Read all records with the **old** key in a read transaction.
+   - Write all records back with the **new** key in a write transaction.
+   - Save `new_counter` to `CONFIG_TABLE`.
+5. The in-memory `EncryptedDb.key` is set to the new session key for all subsequent runtime reads/writes.
+
+### Important constraints
+- redb write transactions block concurrent read transactions — always read everything in one read txn, then write everything in a separate write txn.
+- The counter itself is not sensitive and does not need encryption.
+- Never change `master_key` after a DB has been populated — all data will become unreadable (the derived keys chain off it).
+
+---
+
+## Backpressure and Packet Batching (protocol/handlers.rs)
+
+### Bounded outbound channel
+
+Each client task creates a bounded mpsc channel:
+```rust
+let cap = state.config.server.outbound_queue_cap.max(4);
+let (tx, mut rx) = mpsc::channel::<String>(cap);
+```
+
+`ClientHandle::send` and `ClientSession::send_raw` use `try_send` — silently drop if the channel is full. This is intentional: a persistently slow client accumulates backpressure until the keepalive timeout disconnects it. Do not change `try_send` to `send().await`.
+
+### Packet batching
+
+In the `run_client` select loop, after the first message is received from `rx`, all immediately available messages are drained and concatenated into a single `transport.send()` call:
+
+```rust
+Some(msg) = rx.recv() => {
+    let mut outbound = String::new();
+    // Handle first message
+    if msg.starts_with("__") {
+        // internal control message — flush pending then process
+        handle_internal(&mut session, &state, ...).await;
+    } else {
+        outbound.push_str(&msg);
+    }
+    // Drain the rest without blocking
+    loop {
+        match rx.try_recv() {
+            Ok(m) if m.starts_with("__") => {
+                if !outbound.is_empty() { transport.send(&outbound).await; outbound.clear(); }
+                handle_internal(&mut session, &state, ...).await;
+            }
+            Ok(m) => outbound.push_str(&m),
+            Err(_) => break,
+        }
+    }
+    if !outbound.is_empty() { transport.send(&outbound).await; }
+}
+```
+
+**Internal messages** (`"__"` prefix, e.g. `__CLEAR__`, `__LOGOUT__`) are control signals, not wire data. When one appears mid-drain, flush any accumulated outbound data first, then process the internal message, then continue draining.

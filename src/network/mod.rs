@@ -25,6 +25,16 @@ impl AoTransport {
         }
     }
 
+    /// Send raw binary data (MessagePack payload).
+    /// For WebSocket: sent as a Binary frame.
+    /// For TCP: not supported; silently drops the packet.
+    pub async fn send_binary(&mut self, data: &[u8]) -> Result<()> {
+        match self {
+            AoTransport::Tcp(_) => Ok(()), // Binary frames not supported on plain TCP
+            AoTransport::Ws(t) => t.send_binary(data).await,
+        }
+    }
+
     pub async fn recv_packet(&mut self) -> Option<Result<Packet>> {
         match self {
             AoTransport::Tcp(t) => t.recv_packet().await,
