@@ -71,6 +71,9 @@ Drop the binary and run it — Ferris-AO writes `config.toml` and the entire `da
 - **Narrator mode** — Speak without a character sprite
 - **DJ role** — Players with the DJ permission can use `/play` and stream audio URLs in any area without CM status
 - **Dice and coins** — `/roll [NdM]` (up to 20 dice, 2–10000 sides) and `/flip` broadcast to the area
+- **Radio stations** — Config-defined stations played via `/radio <n>`; DJs/CMs or anyone (configurable)
+- **Blankpost toggle** — Per-area `allow_blankpost` setting; when `false`, empty IC messages are rejected with a notice
+- **Area rename** — Mods can rename areas at runtime with `/rename <new name>` without restarting
 
 ### Performance & Reliability
 - **Backpressure** — Each client has a bounded outbound channel; persistently slow clients are shed gracefully without blocking others
@@ -85,9 +88,13 @@ Drop the binary and run it — Ferris-AO writes `config.toml` and the entire `da
 - **Secret rotation** — `/rotatesecret` generates a new HMAC key; applied on next restart with `secret_rotation_enabled = true`
 - **DB key rotation** — `/rotatekey` generates a new AES-256 key file; activated on next restart with `key_rotation_enabled = true`
 - **Minimal logging mode** — Set `log_level = "minimal"` to suppress everything below warnings
+- **TOTP two-factor authentication** — Accounts can enable RFC 6238 TOTP (`/2fa enable`); login requires a 6-digit code after the password. Compatible with any TOTP app (Google Authenticator, Aegis, Authy).
+- **Argon2id pepper** — Optional server-side pepper (HMAC-SHA256) mixed into every password before Argon2id. Set via `NYAHAO_PEPPER` env var or `[security] password_pepper` in config.
+- **Panic backtrace** — Set `panic_backtrace = true` in `[server]` to enable `RUST_BACKTRACE=full` and a crash hook that prints the full backtrace on panic.
 
 ### Networking
 - **WebSocket keepalive** — Configurable Ping/Pong intervals to detect stale connections
+- **Native TLS WebSocket** — Set `tls_cert_path` and `tls_key_path` in `[network]` to accept `wss://` directly without a reverse proxy (tokio-rustls + rustls, PEM certificates)
 - **PROXY Protocol v2** — Recovers real client IPs behind nginx
 - **Cloudflare-ready** — Handles `CF-Connecting-IP`, `X-Forwarded-For`, `X-Real-IP`
 - **Cluster gossip** — Optional UDP gossip heartbeat with consistent-hash ring for multi-node routing (requires shared backend — see `cluster.enabled` in config)
@@ -304,6 +311,7 @@ Ferris-AO is configured via `config.toml` in the working directory.
 | `argon2_parallelism` | integer | `2` | Argon2id parallelism (thread count). |
 | `binary_protocol` | boolean | `false` | Allow clients to negotiate MessagePack binary encoding via `BINARY#1#%`. Reduces bandwidth for WebSocket clients. |
 | `packet_batch_size` | integer | `0` | Reserved for timer-based packet batching. `0` = disabled (current burst-drain batching always active). |
+| `panic_backtrace` | boolean | `false` | When `true`, sets `RUST_BACKTRACE=full` and installs a crash hook that prints the full backtrace on panic before exiting. |
 
 ### `[network]`
 
@@ -318,6 +326,14 @@ Ferris-AO is configured via `config.toml` in the working directory.
 | `ws_ping_interval_secs` | integer | `30` | Seconds between WebSocket Ping frames for keepalive. Set to `0` to disable. |
 | `ws_ping_timeout_secs` | integer | `90` | Seconds to wait for a Pong response before treating the connection as stale and closing it. Set to `0` to disable. |
 | `ws_compression` | boolean | `false` | Reserved for WebSocket permessage-deflate support (requires future tungstenite upgrade). |
+| `tls_cert_path` | string | `""` | Path to a PEM certificate file (e.g. `fullchain.pem`). When both TLS paths are set, the WebSocket port accepts `wss://` directly without a reverse proxy. |
+| `tls_key_path` | string | `""` | Path to a PEM private key file (e.g. `privkey.pem`). |
+
+### `[security]`
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `password_pepper` | string | `""` | Server-side pepper mixed into all password hashes via `HMAC-SHA256(pepper, password)` before Argon2id. The `NYAHAO_PEPPER` env var takes priority. **Warning:** Changing this after accounts are created invalidates all existing passwords. |
 
 ### `[privacy]`
 
@@ -349,6 +365,27 @@ The server posts immediately on startup, every 5 minutes, and whenever the playe
 |---|---|---|---|
 | `log_level` | string | `"info"` | Tracing log level: `trace`, `debug`, `info`, `warn`, `error`, or `"minimal"` (alias for `warn` — warnings and errors only) |
 | `log_chat` | boolean | `false` | Whether to log IC message content. Disabled by default for privacy. |
+
+### `[radio]`
+
+Optional. Defines radio stations playable via `/radio`. Disabled by default.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Enable the `/radio` command |
+| `anyone_can_use` | boolean | `true` | When `true`, any player can use `/radio`; when `false`, only DJs and area CMs |
+| `stations` | array | `[]` | List of `[[radio.stations]]` entries, each with `name`, `url`, and optional `genre` |
+
+```toml
+[radio]
+enabled = true
+anyone_can_use = true
+
+[[radio.stations]]
+name  = "Lo-fi Hip-Hop"
+url   = "https://example.com/lofi.mp3"
+genre = "Lo-fi"
+```
 
 ### `[cluster]`
 
@@ -567,6 +604,7 @@ lock_music = false
 | `lock_music` | bool | *(required)* | Prevent music changes via packet (mods can still override) |
 | `max_players` | integer | *(none)* | Optional cap on players in this area. Omit for unlimited. |
 | `owner` | string | *(none)* | Optional account username that automatically receives CM status when they join this area. |
+| `allow_blankpost` | bool | `true` | When `false`, players cannot send empty IC messages. |
 
 ---
 
@@ -1171,6 +1209,11 @@ Commands are entered in the OOC chat box prefixed with `/`.
 | `/ignore <uid>` | Hide IC and OOC messages from a player (session only — resets on disconnect) |
 | `/unignore <uid>` | Stop ignoring a player |
 | `/ignorelist` | Show which UIDs you are currently ignoring |
+| `/radio` | List available radio stations |
+| `/radio <n>` | Play radio station number `n` in the current area (DJ/CM required if `anyone_can_use = false`) |
+| `/2fa enable` | Enable TOTP two-factor authentication on your account. Returns an `otpauth://` URI to scan with an authenticator app. |
+| `/2fa disable <code>` | Disable TOTP 2FA after verifying a current code |
+| `/2fa status` | Check whether 2FA is enabled on your account |
 
 ### Moderator Commands
 
@@ -1193,6 +1236,7 @@ These commands require specific permissions (see [Permission System](#permission
 | `/watchlist add <hdid> [note]` | `WATCHLIST` | Add a hashed HDID to the watchlist with an optional note. |
 | `/watchlist remove <hdid>` | `WATCHLIST` | Remove a hashed HDID from the watchlist. |
 | `/watchlist list` | `WATCHLIST` | List all watchlist entries with who added them and when. |
+| `/rename <name>` | `MODIFY_AREA` | Rename the current area at runtime. The new name is shown in ARUP and CT notices immediately. |
 | `/reload` | `ADMIN` | Hot-reload characters, music, backgrounds, and censor words without restarting. |
 | `/logoutall` | `ADMIN` | Force-logout all authenticated moderator sessions. |
 | `/rotatekey` | `ADMIN` | Generate a new AES-256 DB key to `data/db_key_new.hex`. Set `key_rotation_enabled = true` and restart to apply. |
@@ -1274,6 +1318,22 @@ HDIDs are sent by the AO2 client as a persistent hardware fingerprint. Ferris-AO
 - Stored in the unencrypted `CONFIG` database table (protected by the `NYAHAO_DB_KEY` env var at the OS level)
 - Never logged or printed
 - Changing the secret invalidates all existing IPIDs and HDID hashes — avoid doing this after launch
+
+### Password Pepper
+
+An optional server-side pepper is mixed into every password hash via `HMAC-SHA256(pepper, password)` before the result is fed to Argon2id. This means a database leak alone is not enough to crack passwords — an attacker also needs the pepper, which is kept in the environment variable `NYAHAO_PEPPER` and never stored in the DB.
+
+Set it once before any accounts are created. **Never change it** after accounts exist — all existing passwords will become unverifiable.
+
+```bash
+export NYAHAO_PEPPER="$(openssl rand -hex 32)"
+```
+
+Or set it in `config.toml`:
+```toml
+[security]
+password_pepper = "your_secret_pepper_here"
+```
 
 ### What is never stored
 

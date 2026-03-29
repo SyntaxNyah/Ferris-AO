@@ -808,6 +808,22 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
         return;
     }
 
+    // Blankpost check: if the area disallows blank IC messages, intercept them.
+    {
+        let msg_text = crate::protocol::packet::ao_decode(&args[4]);
+        if msg_text.trim().is_empty() {
+            let area_guard = state.areas[session.area_idx].read().await;
+            if !area_guard.allow_blankpost {
+                drop(area_guard);
+                session.server_message(
+                    &state.config.server.name,
+                    "Blank posts are not allowed in this area.",
+                );
+                return;
+            }
+        }
+    }
+
     // Censor check: if enabled and the decoded message contains a censored word,
     // treat it like a shadowmute — the sender sees it succeed, others don't get it.
     if state.config.censor.enabled {
@@ -981,15 +997,7 @@ async fn handle_ct(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
         return;
     }
 
-    // Check for duplicate OOC name
-    {
-        let clients = state.clients.lock().await;
-        let uid = session.uid.unwrap_or(u32::MAX);
-        for handle in clients.values() {
-            // We can't check OOC name in other sessions (cross-task).
-            // In a simple implementation, OOC name conflicts are best-effort.
-        }
-    }
+    // OOC name conflicts are best-effort — we don't check other sessions.
     session.ooc_name = username.clone();
 
     // Command dispatch

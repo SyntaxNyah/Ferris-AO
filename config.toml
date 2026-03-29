@@ -8,6 +8,8 @@ asset_url = ""
 multiclient_limit = 8
 # Hard limit on incoming packet size in bytes. Packets exceeding this are dropped before parsing.
 max_packet_bytes = 8192
+# Enable full panic backtraces on crash. Sets RUST_BACKTRACE=full and logs the backtrace.
+# panic_backtrace = false
 
 [network]
 tcp_port = 27017
@@ -24,6 +26,13 @@ reverse_proxy_https_port = 443
 ws_ping_interval_secs = 30
 # WebSocket keepalive: seconds to wait for a Pong before closing the connection. 0 = no timeout.
 ws_ping_timeout_secs = 90
+# Native TLS for WebSocket (wss:// without a reverse proxy).
+# Set both paths to enable; leave empty for plain ws:// (default).
+# Example:
+#   tls_cert_path = "/etc/letsencrypt/live/example.com/fullchain.pem"
+#   tls_key_path  = "/etc/letsencrypt/live/example.com/privkey.pem"
+tls_cert_path = ""
+tls_key_path  = ""
 
 [privacy]
 # If unset, a server secret is generated at startup and stored in the database.
@@ -39,6 +48,13 @@ advertise = false
 addr = "https://servers.aceattorneyonline.com/servers"
 # Optional: hostname or IP to advertise. Leave unset to let the master server detect it.
 # hostname = "your.domain.example"
+
+[security]
+# Server-side pepper mixed into password hashes via HMAC-SHA256.
+# The NYAHAO_PEPPER env var takes priority over this field.
+# If empty/unset, no pepper is applied (backward-compatible with existing accounts).
+# WARNING: Changing the pepper after accounts exist invalidates all passwords.
+password_pepper = ""
 
 [censor]
 # When true, IC messages containing any word from data/censor.txt are silently
@@ -73,3 +89,18 @@ zz_cooldown_secs = 60
 # 1.0 = 1 per second sustained (60/min), burst absorbs quick reconnects from bad WiFi.
 conn_rate  = 1.0
 conn_burst = 5
+
+# Radio stations.  Disabled by default.
+# [radio]
+# enabled = true
+# anyone_can_use = true   # false = DJs and area CMs only
+#
+# [[radio.stations]]
+# name  = "Lo-fi Hip-Hop"
+# url   = "https://example.com/lofi.mp3"
+# genre = "Lo-fi"
+#
+# [[radio.stations]]
+# name  = "Court Radio"
+# url   = "https://example.com/court.mp3"
+# genre = "Ambient"

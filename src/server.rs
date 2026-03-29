@@ -5,7 +5,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
-use tokio::sync::{mpsc, mpsc::Sender, watch, Mutex, RwLock};
+use tokio::sync::{mpsc::Sender, watch, Mutex, RwLock};
 use std::collections::HashMap;
 
 use std::collections::HashSet;
@@ -128,9 +128,10 @@ impl ServerState {
         privacy: PrivacyLayer,
         db: Arc<EncryptedDb>,
         player_watch_tx: watch::Sender<usize>,
+        pepper: String,
     ) -> Self {
         let max = config.server.max_players;
-        let accounts = AccountManager::new(Arc::clone(&db));
+        let accounts = AccountManager::new_with_pepper(Arc::clone(&db), pepper);
         let bans = BanManager::new(Arc::clone(&db));
         let ipid_bans = IpidBanManager::new(Arc::clone(&db));
         let watchlist = WatchlistManager::new(Arc::clone(&db));

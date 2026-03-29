@@ -65,7 +65,13 @@ pub struct AreaConfig {
     /// Account username that auto-receives CM when they join this area.
     #[serde(default)]
     pub owner: Option<String>,
+    /// When false, IC messages with empty or whitespace-only text are silently
+    /// rejected and the sender receives a notice.  Default: true.
+    #[serde(default = "default_allow_blankpost")]
+    pub allow_blankpost: bool,
 }
+
+fn default_allow_blankpost() -> bool { true }
 
 #[derive(Debug, Deserialize)]
 pub struct AreasFile {
@@ -102,6 +108,8 @@ pub struct Area {
     pub bg: String,
     pub last_speaker: Option<usize>,
     pub log_buffer: VecDeque<String>,
+    /// See AreaConfig.allow_blankpost.
+    pub allow_blankpost: bool,
 }
 
 impl Area {
@@ -123,6 +131,8 @@ impl Area {
             lock_music: cfg.lock_music,
             max_players: cfg.max_players,
             owner: cfg.owner.clone(),
+
+            allow_blankpost: cfg.allow_blankpost,
 
             taken: vec![false; char_count],
             players: 0,

@@ -3,7 +3,10 @@ use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Algorithm, Argon2, Params, Version,
 };
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::storage::EncryptedDb;
@@ -51,16 +54,50 @@ pub struct Account {
     pub username: String,
     pub password_hash: String,
     pub permissions: u64,
+    /// Base32-encoded TOTP secret.  None = 2FA disabled.
+    #[serde(default)]
+    pub totp_secret: Option<String>,
+}
+
+/// Result of an authentication attempt that may require a second factor.
+#[derive(Debug)]
+pub enum AuthResult {
+    /// Password was correct and no 2FA is configured.
+    Success(u64),
+    /// Password was correct but TOTP code must be verified next.
+    /// Carries the permissions to grant after TOTP succeeds.
+    NeedsTOTP(u64),
+    /// Invalid username or password.
+    InvalidCredentials,
 }
 
 #[derive(Clone)]
 pub struct AccountManager {
     db: Arc<EncryptedDb>,
+    /// Server-side pepper applied to passwords before Argon2id.
+    pepper: String,
 }
 
 impl AccountManager {
     pub fn new(db: Arc<EncryptedDb>) -> Self {
-        Self { db }
+        Self { db, pepper: String::new() }
+    }
+
+    pub fn new_with_pepper(db: Arc<EncryptedDb>, pepper: String) -> Self {
+        Self { db, pepper }
+    }
+
+    /// Apply the server-side pepper to a password via HMAC-SHA256.
+    /// Returns a Cow::Borrowed if no pepper is set (zero allocation).
+    fn pepper_password<'a>(&self, password: &'a str) -> Cow<'a, str> {
+        if self.pepper.is_empty() {
+            return Cow::Borrowed(password);
+        }
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(self.pepper.as_bytes())
+            .expect("HMAC accepts any key size");
+        mac.update(password.as_bytes());
+        Cow::Owned(hex::encode(mac.finalize().into_bytes()))
     }
 
     /// Hash a password with Argon2id using default parameters.
@@ -116,11 +153,13 @@ impl AccountManager {
         iterations: u32,
         parallelism: u32,
     ) -> Result<()> {
-        let hash = Self::hash_password_with_params(password, memory_kib, iterations, parallelism)?;
+        let effective = self.pepper_password(password);
+        let hash = Self::hash_password_with_params(&effective, memory_kib, iterations, parallelism)?;
         let account = Account {
             username: username.to_lowercase(),
             password_hash: hash,
             permissions: perms::from_role(role),
+            totp_secret: None,
         };
         let encoded = serde_json::to_vec(&account)?;
         self.db.accounts_insert(&username.to_lowercase(), &encoded)
@@ -137,18 +176,23 @@ impl AccountManager {
         }
     }
 
-    /// Authenticate username + password. Returns permissions on success.
-    /// NOTE: Call this inside tokio::task::spawn_blocking due to Argon2 cost.
-    pub fn authenticate(&self, username: &str, password: &str) -> Result<Option<u64>> {
+    /// Authenticate username + password. Returns an AuthResult.
+    /// NOTE: Call inside tokio::task::spawn_blocking due to Argon2 cost.
+    pub fn authenticate(&self, username: &str, password: &str) -> Result<AuthResult> {
+        let effective = self.pepper_password(password);
         match self.get(username)? {
             Some(account) => {
-                if Self::verify_password(&account.password_hash, password) {
-                    Ok(Some(account.permissions))
+                if Self::verify_password(&account.password_hash, &effective) {
+                    if account.totp_secret.is_some() {
+                        Ok(AuthResult::NeedsTOTP(account.permissions))
+                    } else {
+                        Ok(AuthResult::Success(account.permissions))
+                    }
                 } else {
-                    Ok(None)
+                    Ok(AuthResult::InvalidCredentials)
                 }
             }
-            None => Ok(None),
+            None => Ok(AuthResult::InvalidCredentials),
         }
     }
 
@@ -167,5 +211,71 @@ impl AccountManager {
                 Ok(true)
             }
         }
+    }
+
+    /// Set up TOTP for an account. Returns the otpauth:// URI to show the user.
+    /// The URI can be scanned by any TOTP authenticator (Google Authenticator,
+    /// Authy, Aegis, etc.).
+    pub fn enable_totp(&self, username: &str, issuer: &str) -> Result<String> {
+        use totp_rs::{Algorithm, Secret, TOTP};
+        let key = username.to_lowercase();
+        let mut account = match self.get(&key)? {
+            Some(a) => a,
+            None => anyhow::bail!("Account not found"),
+        };
+        let secret = Secret::generate_secret();
+        let totp = TOTP::new(
+            Algorithm::SHA1, 6, 1, 30,
+            secret.to_bytes().map_err(|e| anyhow::anyhow!("TOTP secret error: {}", e))?,
+            Some(issuer.to_string()),
+            key.clone(),
+        ).map_err(|e| anyhow::anyhow!("TOTP init error: {}", e))?;
+        let uri = totp.get_url();
+        account.totp_secret = Some(secret.to_encoded().to_string());
+        let encoded = serde_json::to_vec(&account)?;
+        self.db.accounts_insert(&key, &encoded)?;
+        Ok(uri)
+    }
+
+    /// Disable TOTP for an account after verifying the current TOTP code.
+    pub fn disable_totp(&self, username: &str, code: &str) -> Result<bool> {
+        let key = username.to_lowercase();
+        let mut account = match self.get(&key)? {
+            Some(a) => a,
+            None => return Ok(false),
+        };
+        if !Self::verify_totp_code(account.totp_secret.as_deref(), code) {
+            return Ok(false);
+        }
+        account.totp_secret = None;
+        let encoded = serde_json::to_vec(&account)?;
+        self.db.accounts_insert(&key, &encoded)?;
+        Ok(true)
+    }
+
+    /// Verify a 6-digit TOTP code against the stored secret.
+    /// Returns false if no TOTP secret is configured.
+    pub fn verify_totp_for(&self, username: &str, code: &str) -> Result<bool> {
+        match self.get(&username.to_lowercase())? {
+            Some(account) => Ok(Self::verify_totp_code(account.totp_secret.as_deref(), code)),
+            None => Ok(false),
+        }
+    }
+
+    fn verify_totp_code(secret_b32: Option<&str>, code: &str) -> bool {
+        use totp_rs::{Algorithm, Secret, TOTP};
+        let b32 = match secret_b32 {
+            Some(s) => s,
+            None => return false,
+        };
+        let bytes = match Secret::Encoded(b32.to_string()).to_bytes() {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let totp = match TOTP::new(Algorithm::SHA1, 6, 1, 30, bytes, None, String::new()) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        totp.check_current(code).unwrap_or(false)
     }
 }

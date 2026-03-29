@@ -203,9 +203,15 @@ pub struct Packet {
 | `/lock [-s]` | Lock area; `-s` = spectatable mode (requires BYPASS_LOCK or CM) |
 | `/unlock` | Unlock area |
 | `/play <song or URL>` | Play a music file or stream an http(s):// URL. Requires in-area CM, PERM_CM, or PERM_DJ. |
+| `/radio` | List available radio stations (requires `radio.enabled = true` in config) |
+| `/radio <n>` | Play radio station `n` by number. Requires DJ/CM if `anyone_can_use = false`. |
 | `/roll [NdM]` | Roll dice and broadcast result. Default `1d6`. Max 20 dice, sides 2–10000. |
 | `/flip` | Flip a coin (Heads/Tails) and broadcast result. |
-| `/login <u> <p>` | Authenticate; runs Argon2id verify in `spawn_blocking` |
+| `/login <u> <p>` | Authenticate; runs Argon2id verify in `spawn_blocking`. Returns `NeedsTOTP` if 2FA is enabled. |
+| `/login <u> <p> <totp_code>` | Full login with TOTP code in a single command (alternative to two-step flow) |
+| `/2fa enable` | Enable TOTP 2FA on your account. Returns `otpauth://` URI to scan with authenticator app. |
+| `/2fa disable <code>` | Disable TOTP 2FA after verifying a current 6-digit code. |
+| `/2fa status` | Check whether 2FA is currently enabled on your account. |
 | `/logout` | Deauthenticate |
 | `/pair <uid>` | Request pairing with another player |
 | `/unpair` | Cancel pairing |
@@ -228,6 +234,7 @@ pub struct Packet {
 | `/modchat <msg>` | `MOD_CHAT` | CT message to authenticated mods only |
 | `/ipban <uid> [dur] <reason>` | `KICK` | Ban by target's current IPID (daily-rotating); duration: `1h`/`6h`/`12h`/`1d`/`7d` or permanent |
 | `/unipban <ipid>` | `BAN` | Remove an IPID ban |
+| `/rename <name>` | `MODIFY_AREA` | Rename the current area at runtime; broadcasts CT notice + updates ARUP |
 | `/ignore <uid>` | — | Hide IC+OOC from a player (session-only, resets on disconnect); stored in `ClientHandle.ignored_uids` |
 | `/unignore <uid>` | — | Stop ignoring a player |
 | `/ignorelist` | — | Show your current ignore list |
@@ -287,6 +294,10 @@ Config {
     logging: LoggingConfig,
     master_server: MasterServerConfig,   // #[serde(default)]
     rate_limits: RateLimitsConfig,       // #[serde(default)]
+    censor: CensorConfig,                // #[serde(default)]
+    cluster: GossipConfig,               // #[serde(default)]
+    radio: RadioConfig,                  // #[serde(default)]
+    security: SecurityConfig,            // #[serde(default)]
 }
 ```
 
@@ -294,12 +305,21 @@ Config {
 - `name`, `description`, `motd`, `max_players`, `max_message_len`, `asset_url`, `multiclient_limit`
 - `max_packet_bytes` (default: 8192) — hard drop before parsing
 - `outbound_queue_cap` (default: 256) — max packets queued per client; excess silently dropped (backpressure)
+- `panic_backtrace` (default: false) — installs custom panic hook + `RUST_BACKTRACE=full` on startup
 
 **NetworkConfig** key fields:
 - `tcp_port` (27017), `ws_port` (27018), `bind_addr`
 - `reverse_proxy_mode` — when true, trust X-Forwarded-For / X-Real-IP; also enables PP2 on TCP
 - `reverse_proxy_http_port` (80), `reverse_proxy_https_port` (443)
 - `ws_ping_interval_secs` (30), `ws_ping_timeout_secs` (90)
+- `tls_cert_path`, `tls_key_path` — when both non-empty, WS port accepts wss:// via tokio-rustls
+
+**SecurityConfig** (entire section optional):
+- `password_pepper` — HMAC-SHA256 pepper applied to passwords before Argon2id; `NYAHAO_PEPPER` env var takes priority
+
+**RadioConfig** (entire section optional):
+- `enabled` (default: false), `anyone_can_use` (default: true), `stations: Vec<RadioStation>`
+- Each `RadioStation`: `name`, `url`, `genre`
 
 **CensorConfig** (entire section optional):
 - `enabled` (default: `false`) — when true, IC messages matching `censor_words` are silently intercepted
@@ -328,6 +348,7 @@ pub struct Area {
     pub evi_mode: EvidenceMode,   // Any | CMs | Mods
     pub allow_iniswap: bool,
     pub allow_cms: bool,
+    pub allow_blankpost: bool,    // default: true; when false, empty IC messages are rejected
     pub force_nointerrupt: bool,
     pub force_bglist: bool,
     pub lock_bg: bool,
@@ -429,6 +450,7 @@ Wraps [redb](https://github.com/cberner/redb) (embedded MVCC key-value). Encrypt
 - `Message::Ping` uses `Bytes` (tungstenite 0.26 — use `vec![].into()`)
 - **Write-buffer tuning:** `WebSocketConfig::default().write_buffer_size(128 * 1024).max_write_buffer_size(256 * 1024)` — accommodates multi-packet bursts without excessive buffering
 - **`WebSocketConfig` is `#[non_exhaustive]`:** cannot use struct literal + `..Default::default()`. Must use the builder method chain shown above.
+- **Native TLS (wss://):** `listen_ws` takes `tls: Option<Arc<TlsAcceptor>>`. When non-None, each incoming `TcpStream` is wrapped via `acceptor.accept(stream).await?` into a `TlsStream<TcpStream>`, then boxed as `Box<dyn AsyncIo>` for the WebSocket upgrade. `WsTransport.ws` is `WebSocketStream<Box<dyn AsyncIo>>` rather than `WebSocketStream<TcpStream>`. Built in `main.rs` from `tls_cert_path` + `tls_key_path` config fields using `rustls_pemfile::certs()` / `private_key()`.
 - **permessage-deflate (TODO):** tungstenite 0.26 does not expose a compression API. When upgrading to a version that does, add `DeflateConfig::default()` to the config — clients negotiate it automatically, others fall back. A TODO comment marks the spot in `accept_ws`.
 
 ### AoTransport enum (network/mod.rs)
@@ -580,15 +602,42 @@ Exceeded packets are **silently dropped**.
 ```rust
 pub struct Account {
     pub username: String,
-    pub password_hash: String,  // Argon2id PHC string
+    pub password_hash: String,       // Argon2id PHC string
     pub permissions: u64,
+    pub totp_secret: Option<String>, // Base32-encoded TOTP secret; None = 2FA disabled
+}
+
+pub enum AuthResult {
+    Success(u64),          // Password OK, no 2FA
+    NeedsTOTP(u64),        // Password OK, TOTP code still required; carries permissions
+    InvalidCredentials,    // Wrong username or password
+}
+
+pub struct AccountManager {
+    db: Arc<EncryptedDb>,
+    pepper: String,        // HMAC-SHA256 pepper; empty = no pepper
 }
 ```
 
 `AccountManager` provides:
-- `create(username, password, permissions)` — hashes with Argon2id, stores in DB
-- `authenticate(username, password)` → `Option<permissions>` — verifies hash
+- `new(db)` — no pepper
+- `new_with_pepper(db, pepper)` — with server-side pepper
+- `create(username, password, role)` — hashes with pepper + Argon2id, stores in DB
+- `authenticate(username, password)` → `Result<AuthResult>` — applies pepper, verifies hash, checks TOTP
+- `enable_totp(username, issuer)` → `Result<String>` — generates TOTP secret, stores it, returns `otpauth://` URI
+- `disable_totp(username, code)` → `Result<bool>` — verifies code then removes secret
+- `verify_totp_for(username, code)` → `Result<bool>` — standalone TOTP check
 - `get(username)`, `delete(username)`, `set_permissions(username, perms)`
+
+**Pepper flow:**
+`pepper_password(pw)` → `HMAC-SHA256(pepper, pw)` → hex string → fed to Argon2id as the password to hash.
+When `pepper.is_empty()`, the raw password is used (backward compatible).
+
+**TOTP flow in `/login`:**
+1. `spawn_blocking` → `authenticate(user, pw)` → `AuthResult::NeedsTOTP(perms)`
+2. Server sends OOC message: "Enter your 2FA code: `/login <user> <pass> <totp_code>`"
+3. Client resends with code; `authenticate` is called again — on `NeedsTOTP`, the code is verified via `verify_totp_for`
+4. On success, `session.permissions` is set and `session.authenticated = true`
 
 **Always run Argon2id operations in `tokio::task::spawn_blocking`** — they are CPU-intensive and will block the async runtime if called directly.
 
@@ -693,6 +742,10 @@ Delta suppression means calling these when nothing changed is cheap (early retur
 | `aes-gcm` | 0.10 | `Aes256Gcm`; nonce is 12 bytes |
 | `ppp` | 2.3 | PROXY Protocol v2 parsing |
 | `reqwest` | 0.12 | `rustls-tls` feature; used only in `ms.rs` |
+| `totp-rs` | **5** | `features = ["gen_secret", "otpauth"]` — RFC 6238 TOTP; `TOTP::new` takes 7 args with `otpauth` feature; `get_url()` returns `otpauth://` URI |
+| `tokio-rustls` | 0.26 | TLS acceptor for native `wss://`; used in `network/websocket.rs` |
+| `rustls` | 0.23 | TLS config; used with `tokio-rustls` |
+| `rustls-pemfile` | 2 | PEM certificate/key parsing; `certs()` and `private_key()` functions |
 
 ---
 
@@ -701,6 +754,7 @@ Delta suppression means calling these when nothing changed is cheap (early retur
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `NYAHAO_DB_KEY` | **Yes (production)** | 64-char hex (32 bytes) AES-256-GCM database key. Insecure default used if unset (warns loudly). |
+| `NYAHAO_PEPPER` | No | Server-side pepper for password hashing. Takes priority over `[security] password_pepper` in config.toml. |
 | `RUST_LOG` | No | Override tracing log level (overrides `config.toml` `log_level`) |
 
 ---

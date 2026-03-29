@@ -29,6 +29,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use tokio_rustls::rustls;
 use tokio::sync::{broadcast, watch};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -64,6 +65,20 @@ async fn main() -> Result<()> {
         .with_env_filter(filter)
         .with_target(false)
         .init();
+
+    // ── Panic hook (when panic_backtrace = true) ────────────────────────────────
+    // Read panic_backtrace from a temporary partial config load. We handle it
+    // here before the full state is built so panics in startup are also caught.
+    if config.server.panic_backtrace {
+        std::env::set_var("RUST_BACKTRACE", "full");
+        std::panic::set_hook(Box::new(|info| {
+            eprintln!("[PANIC] {}", info);
+            let bt = std::backtrace::Backtrace::capture();
+            eprintln!("{}", bt);
+            std::process::exit(1);
+        }));
+        info!("Panic backtrace enabled (RUST_BACKTRACE=full).");
+    }
 
     info!("Starting NyahAO server…");
 
@@ -197,6 +212,16 @@ async fn main() -> Result<()> {
         .map(|a| Arc::new(tokio::sync::RwLock::new(a)))
         .collect();
 
+    // ── Load password pepper ───────────────────────────────────────────────────
+    // Priority: NYAHAO_PEPPER env var > config.security.password_pepper > ""
+    let pepper = std::env::var("NYAHAO_PEPPER")
+        .unwrap_or_else(|_| config.security.password_pepper.clone());
+    if pepper.is_empty() {
+        // Not a hard error — backward-compatible with accounts created without pepper.
+    } else {
+        info!("Password pepper loaded ({} bytes).", pepper.len());
+    }
+
     // ── Build shared server state ──────────────────────────────────────────────
     let (player_watch_tx, player_watch_rx) = watch::channel(0usize);
     let state = Arc::new(ServerState::new(
@@ -206,6 +231,7 @@ async fn main() -> Result<()> {
         privacy,
         Arc::clone(&db),
         player_watch_tx,
+        pepper,
     ));
 
     // ── Shutdown broadcast channel ─────────────────────────────────────────────
@@ -235,10 +261,42 @@ async fn main() -> Result<()> {
     .parse()
     .context("Invalid WebSocket bind address")?;
 
+    // ── Build TLS acceptor for native wss:// (optional) ───────────────────────
+    let tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>> = {
+        let cert_path = &state.config.network.tls_cert_path;
+        let key_path = &state.config.network.tls_key_path;
+        if !cert_path.is_empty() && !key_path.is_empty() {
+            use rustls::ServerConfig as RustlsServerConfig;
+            use rustls_pemfile::{certs, private_key};
+            use tokio_rustls::TlsAcceptor;
+
+            let cert_bytes = std::fs::read(cert_path)
+                .with_context(|| format!("Failed to read TLS cert: {}", cert_path))?;
+            let key_bytes = std::fs::read(key_path)
+                .with_context(|| format!("Failed to read TLS key: {}", key_path))?;
+
+            let certs_parsed: Vec<_> = certs(&mut cert_bytes.as_slice())
+                .collect::<std::result::Result<_, _>>()
+                .context("Failed to parse TLS certificates")?;
+            let key_parsed = private_key(&mut key_bytes.as_slice())
+                .context("Failed to parse TLS private key")?
+                .context("No private key found in TLS key file")?;
+
+            let tls_config = RustlsServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs_parsed, key_parsed)
+                .context("Failed to build TLS config")?;
+            info!("TLS enabled for WebSocket (wss://)");
+            Some(std::sync::Arc::new(TlsAcceptor::from(std::sync::Arc::new(tls_config))))
+        } else {
+            None
+        }
+    };
+
     let ws_state = Arc::clone(&state);
     let ws_shutdown = shutdown_tx.clone();
     let ws_task = tokio::spawn(async move {
-        if let Err(e) = network::websocket::listen_ws(ws_addr, ws_state, ws_shutdown).await {
+        if let Err(e) = network::websocket::listen_ws(ws_addr, ws_state, ws_shutdown, tls_acceptor).await {
             error!("WebSocket listener error: {}", e);
         }
     });

@@ -65,6 +65,10 @@ pub async fn dispatch_command(
         "logoutall" => cmd_logoutall(session, state).await,
         "rotatekey" => cmd_rotatekey(session, state).await,
         "rotatesecret" => cmd_rotatesecret(session, state).await,
+        "rename"    => cmd_rename(session, state, args).await,
+        "radio"     => cmd_radio(session, state, args).await,
+        "2fa"       => cmd_2fa(session, state, args).await,
+        "totp"      => cmd_totp(session, state, args).await,
         _ => {
             session.server_message(&state.config.server.name, &format!("Unknown command: /{}", command));
         }
@@ -77,11 +81,15 @@ Commands:
 /help /about /who /move <area> /charselect /doc [text] /areainfo
 /cm [uid] /uncm [uid] /bg <bg> /status <status> /lock [-s] /unlock
 /play <song or URL>  — CMs and DJs only; URLs stream audio (http/https)
+/radio [list|n]  — list or play a configured radio station
 /roll [NdM]  — roll dice, e.g. /roll 2d6 or /roll d20  |  /flip  — coin flip
 /pair <uid> /unpair /narrator /login <user> <pass> /logout /mod <msg>
 /pm <uid> <msg>  — private message  |  /r <msg>  — reply to last PM
 /ignore <uid>  /unignore <uid>  /ignorelist
 /motd /clear
+/2fa <enable|disable> [code]  — manage two-factor authentication
+/totp <code>  — complete a pending two-factor login
+[CM/MOD] /rename <name>  — rename the current area
 [MOD] /kick <uid> /mute <uid> [ic|ooc|all] /unmute <uid> /shadowmute <uid>
 [MOD] /warn <uid> <reason>
 [MOD] /ban <uid> <reason> /unban <ban_id> /baninfo <hdid_hash> /announce <msg> /modchat <msg>
@@ -515,31 +523,49 @@ async fn cmd_login(session: &mut ClientSession, state: &Arc<ServerState>, args: 
     let username = args[0].clone();
     let password = args[1..].join(" ");
 
-    // Run Argon2 verification in blocking thread
-    let accounts = &state.accounts;
-    match accounts.authenticate(&username, &password) {
-        Ok(Some(perms)) => {
-            session.authenticated = true;
-            session.permissions = perms;
-            session.mod_name = Some(username.clone());
-            session.send_packet("AUTH", &["1"]);
-            session.server_message(&state.config.server.name, &format!("Logged in as {}.", username));
-            // Update client handle
-            if let Some(uid) = session.uid {
-                let mut clients = state.clients.lock().await;
-                if let Some(handle) = clients.get_mut(&uid) {
-                    let handle = Arc::make_mut(handle);
-                    handle.authenticated = true;
-                }
-            }
+    let accounts = state.accounts.clone();
+    let user2 = username.clone();
+    let pass2 = password.clone();
+    let result = tokio::task::spawn_blocking(move || accounts.authenticate(&user2, &pass2)).await;
+
+    match result {
+        Ok(Ok(crate::auth::accounts::AuthResult::Success(perms))) => {
+            complete_login(session, state, &username, perms).await;
         }
-        Ok(None) => {
+        Ok(Ok(crate::auth::accounts::AuthResult::NeedsTOTP(perms))) => {
+            session.pending_auth = Some((username.clone(), perms));
+            session.server_message(
+                &state.config.server.name,
+                "Password accepted. Enter your 6-digit authenticator code: /totp <code>",
+            );
+        }
+        Ok(Ok(crate::auth::accounts::AuthResult::InvalidCredentials)) => {
             session.send_packet("AUTH", &["-1"]);
             session.server_message(&state.config.server.name, "Invalid credentials.");
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::error!("Auth error: {}", e);
             session.server_message(&state.config.server.name, "Authentication error.");
+        }
+        Err(e) => {
+            tracing::error!("Auth task error: {}", e);
+            session.server_message(&state.config.server.name, "Authentication error.");
+        }
+    }
+}
+
+async fn complete_login(session: &mut ClientSession, state: &Arc<ServerState>, username: &str, perms: u64) {
+    session.authenticated = true;
+    session.permissions = perms;
+    session.mod_name = Some(username.to_string());
+    session.pending_auth = None;
+    session.send_packet("AUTH", &["1"]);
+    session.server_message(&state.config.server.name, &format!("Logged in as {}.", username));
+    if let Some(uid) = session.uid {
+        let mut clients = state.clients.lock().await;
+        if let Some(handle) = clients.get_mut(&uid) {
+            let handle = Arc::make_mut(handle);
+            handle.authenticated = true;
         }
     }
 }
@@ -1179,10 +1205,7 @@ async fn cmd_ipban(session: &mut ClientSession, state: &Arc<ServerState>, args: 
         match clients.get(&target_uid) {
             Some(h) => {
                 let char_name = h.char_id
-                    .and_then(|id| {
-                        // We can't await here so just use the raw char_id as string fallback
-                        Some(format!("UID {}", h.uid))
-                    })
+                    .map(|_| format!("UID {}", h.uid))
                     .unwrap_or_else(|| format!("UID {}", h.uid));
                 (h.ipid.clone(), char_name)
             }
@@ -1347,8 +1370,6 @@ async fn cmd_ignorelist(session: &mut ClientSession, state: &Arc<ServerState>) {
 /// Examples: /roll 2d6  /roll d20  /roll 3d100
 /// Limits: up to 20 dice, sides 2–10000.
 async fn cmd_roll(session: &mut ClientSession, state: &Arc<ServerState>, args: Vec<String>) {
-    use rand::Rng;
-
     let notation = args.first().map(|s| s.as_str()).unwrap_or("1d6");
 
     // Parse "NdM", "dM", or plain "N" (treat as 1dN).
@@ -1537,6 +1558,217 @@ async fn cmd_rotatesecret(session: &mut ClientSession, state: &Arc<ServerState>)
                 &state.config.server.name,
                 &format!("Task error: {}", e),
             );
+        }
+    }
+}
+
+/// /rename <new name> — rename the current area at runtime (CM or MODIFY_AREA).
+async fn cmd_rename(session: &mut ClientSession, state: &Arc<ServerState>, args: Vec<String>) {
+    let is_cm = {
+        let area = state.areas[session.area_idx].read().await;
+        area.cms.contains(&session.uid.unwrap_or(u32::MAX))
+    };
+    if !is_cm && !perms::has(session.permissions, perms::MODIFY_AREA) {
+        session.server_message(&state.config.server.name, "You must be a CM or have MODIFY_AREA to rename areas.");
+        return;
+    }
+    if args.is_empty() {
+        session.server_message(&state.config.server.name, "Usage: /rename <new name>");
+        return;
+    }
+    let new_name = args.join(" ");
+    if new_name.is_empty() || new_name.len() > 64 {
+        session.server_message(&state.config.server.name, "Area name must be 1–64 characters.");
+        return;
+    }
+    {
+        let mut area = state.areas[session.area_idx].write().await;
+        area.name = new_name.clone();
+    }
+    // Notify all clients in the area.
+    state.broadcast_to_area(
+        session.area_idx,
+        "CT",
+        &[&state.config.server.name, &format!("Area renamed to: {}", new_name), "1"],
+    ).await;
+    tracing::info!(
+        "Area {} renamed to {:?} by {}",
+        session.area_idx,
+        new_name,
+        session.mod_name.as_deref().unwrap_or(&session.ooc_name)
+    );
+}
+
+/// /radio [list|n] — list or play a configured radio station.
+async fn cmd_radio(session: &mut ClientSession, state: &Arc<ServerState>, args: Vec<String>) {
+    if !state.config.radio.enabled {
+        session.server_message(&state.config.server.name, "Radio is not enabled on this server.");
+        return;
+    }
+    let stations = &state.config.radio.stations;
+    if stations.is_empty() {
+        session.server_message(&state.config.server.name, "No radio stations are configured.");
+        return;
+    }
+
+    // Permission check: if anyone_can_use=false, require DJ or area CM.
+    if !state.config.radio.anyone_can_use {
+        let is_cm = {
+            let area = state.areas[session.area_idx].read().await;
+            area.cms.contains(&session.uid.unwrap_or(u32::MAX))
+        };
+        if !is_cm && !perms::has(session.permissions, perms::DJ) && !perms::has(session.permissions, perms::CM) {
+            session.server_message(&state.config.server.name, "Only DJs and CMs can change the radio station.");
+            return;
+        }
+    }
+
+    // /radio or /radio list
+    if args.is_empty() || args[0].eq_ignore_ascii_case("list") {
+        let mut lines = vec!["Radio stations:".to_string()];
+        for (i, st) in stations.iter().enumerate() {
+            if st.genre.is_empty() {
+                lines.push(format!("  [{}] {}", i + 1, st.name));
+            } else {
+                lines.push(format!("  [{}] {} ({})", i + 1, st.name, st.genre));
+            }
+        }
+        lines.push("Use /radio <number> to play a station.".to_string());
+        session.server_message(&state.config.server.name, &lines.join("\n"));
+        return;
+    }
+
+    // /radio <n or name>
+    let query = args.join(" ");
+    let station = if let Ok(n) = query.parse::<usize>() {
+        stations.get(n.wrapping_sub(1))
+    } else {
+        stations.iter().find(|s| s.name.eq_ignore_ascii_case(&query))
+    };
+
+    match station {
+        Some(st) => {
+            let url = st.url.clone();
+            let name = st.name.clone();
+            let ooc = session.ooc_name.clone();
+            // Broadcast the URL as an MC packet to all area clients.
+            state.broadcast_to_area(
+                session.area_idx,
+                "MC",
+                &[&url, &session.char_id.unwrap_or(0).to_string(), &ooc, "1", "0", "0"],
+            ).await;
+            state.broadcast_to_area(
+                session.area_idx,
+                "CT",
+                &[&state.config.server.name, &format!("{} tuned the radio to: {}", ooc, name), "1"],
+            ).await;
+        }
+        None => {
+            session.server_message(
+                &state.config.server.name,
+                &format!("Station {:?} not found. Use /radio list to see all stations.", query),
+            );
+        }
+    }
+}
+
+/// /2fa <enable|disable> [code] — manage two-factor authentication.
+async fn cmd_2fa(session: &mut ClientSession, state: &Arc<ServerState>, args: Vec<String>) {
+    if !session.authenticated {
+        session.server_message(&state.config.server.name, "You must be logged in to manage 2FA.");
+        return;
+    }
+    let username = match session.mod_name.clone() {
+        Some(u) => u,
+        None => { session.server_message(&state.config.server.name, "Not logged in."); return; }
+    };
+
+    let sub = args.get(0).map(|s| s.as_str()).unwrap_or("");
+    match sub {
+        "enable" => {
+            let accounts = state.accounts.clone();
+            let issuer = state.config.server.name.clone();
+            let user = username.clone();
+            let result = tokio::task::spawn_blocking(move || accounts.enable_totp(&user, &issuer)).await;
+            match result {
+                Ok(Ok(uri)) => {
+                    session.server_message(
+                        &state.config.server.name,
+                        &format!(
+                            "Two-factor authentication enabled!\n\
+                             Scan this URI with Google Authenticator, Authy, Aegis, or any TOTP app:\n\
+                             {}\n\
+                             You will need your TOTP code on every /login from now on.\n\
+                             Use /2fa disable <code> to remove it.",
+                            uri
+                        ),
+                    );
+                    tracing::info!("/2fa enable: TOTP enabled for {}", username);
+                }
+                Ok(Err(e)) => session.server_message(&state.config.server.name, &format!("Error enabling 2FA: {}", e)),
+                Err(e)     => session.server_message(&state.config.server.name, &format!("Task error: {}", e)),
+            }
+        }
+        "disable" => {
+            let code = args.get(1).cloned().unwrap_or_default();
+            if code.is_empty() {
+                session.server_message(&state.config.server.name, "Usage: /2fa disable <current_totp_code>");
+                return;
+            }
+            let accounts = state.accounts.clone();
+            let user = username.clone();
+            let result = tokio::task::spawn_blocking(move || accounts.disable_totp(&user, &code)).await;
+            match result {
+                Ok(Ok(true))  => session.server_message(&state.config.server.name, "Two-factor authentication disabled."),
+                Ok(Ok(false)) => session.server_message(&state.config.server.name, "Invalid TOTP code or 2FA not enabled."),
+                Ok(Err(e))    => session.server_message(&state.config.server.name, &format!("Error: {}", e)),
+                Err(e)        => session.server_message(&state.config.server.name, &format!("Task error: {}", e)),
+            }
+        }
+        _ => {
+            session.server_message(
+                &state.config.server.name,
+                "Usage: /2fa enable  |  /2fa disable <code>",
+            );
+        }
+    }
+}
+
+/// /totp <code> — complete a pending two-factor login.
+async fn cmd_totp(session: &mut ClientSession, state: &Arc<ServerState>, args: Vec<String>) {
+    let pending = match session.pending_auth.take() {
+        Some(p) => p,
+        None => {
+            session.server_message(&state.config.server.name, "No pending TOTP authentication. Use /login first.");
+            return;
+        }
+    };
+    let (username, perms) = pending;
+
+    if args.is_empty() {
+        session.server_message(&state.config.server.name, "Usage: /totp <6-digit code>");
+        // Put back pending state so they can try again
+        session.pending_auth = Some((username, perms));
+        return;
+    }
+    let code = args[0].clone();
+
+    let accounts = state.accounts.clone();
+    let user2 = username.clone();
+    let valid = tokio::task::spawn_blocking(move || accounts.verify_totp_for(&user2, &code)).await;
+
+    match valid {
+        Ok(Ok(true)) => {
+            complete_login(session, state, &username, perms).await;
+        }
+        Ok(Ok(false)) | Ok(Err(_)) => {
+            session.send_packet("AUTH", &["-1"]);
+            session.server_message(&state.config.server.name, "Invalid TOTP code. Please /login again.");
+            // pending_auth already taken (None) — auth is reset
+        }
+        Err(e) => {
+            tracing::error!("TOTP task error: {}", e);
+            session.server_message(&state.config.server.name, "Authentication error.");
         }
     }
 }

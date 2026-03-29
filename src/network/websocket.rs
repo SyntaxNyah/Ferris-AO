@@ -7,6 +7,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use tokio_rustls::TlsAcceptor;
 
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
@@ -28,9 +29,14 @@ use crate::server::ServerState;
 
 use super::{handle_connection, AoTransport};
 
+/// Combined async read+write trait used to box plain TCP and TLS streams
+/// under the same WebSocket transport type.
+trait AsyncIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> AsyncIo for T {}
+
 /// A WebSocket transport that accumulates frames until `%` appears.
 pub struct WsTransport {
-    ws: WebSocketStream<TcpStream>,
+    ws: WebSocketStream<Box<dyn AsyncIo>>,
     buf: String,
     /// Time of the last received Pong frame (or transport creation).
     pub last_pong: std::time::Instant,
@@ -104,6 +110,7 @@ pub async fn listen_ws(
     addr: SocketAddr,
     state: Arc<ServerState>,
     shutdown_tx: broadcast::Sender<()>,
+    tls: Option<Arc<TlsAcceptor>>,
 ) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!("WebSocket listener on {}", addr);
@@ -116,8 +123,9 @@ pub async fn listen_ws(
                     Ok((stream, peer)) => {
                         let state2 = Arc::clone(&state);
                         let client_shutdown = shutdown_tx.subscribe();
+                        let tls2 = tls.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = accept_ws(stream, peer, state2, client_shutdown).await {
+                            if let Err(e) = accept_ws(stream, peer, state2, client_shutdown, tls2).await {
                                 debug!("WS connection error from {}: {}", peer, e);
                             }
                         });
@@ -139,6 +147,7 @@ async fn accept_ws(
     peer: SocketAddr,
     state: Arc<ServerState>,
     shutdown: broadcast::Receiver<()>,
+    tls: Option<Arc<TlsAcceptor>>,
 ) -> Result<()> {
     let proxy_mode = state.config.network.reverse_proxy_mode;
 
@@ -161,7 +170,20 @@ async fn accept_ws(
         .write_buffer_size(128 * 1024)
         .max_write_buffer_size(256 * 1024);
 
-    let ws = accept_hdr_async_with_config(stream, move |req: &Request, mut res: Response| {
+    // Optionally wrap in TLS before WebSocket upgrade.
+    let boxed_stream: Box<dyn AsyncIo> = if let Some(acceptor) = tls.as_deref() {
+        match acceptor.accept(stream).await {
+            Ok(tls_stream) => Box::new(tls_stream),
+            Err(e) => {
+                debug!("TLS handshake failed from {}: {}", peer, e);
+                return Ok(());
+            }
+        }
+    } else {
+        Box::new(stream)
+    };
+
+    let ws = accept_hdr_async_with_config(boxed_stream, move |req: &Request, mut res: Response| {
         // Sub-protocol acknowledgement: if the client advertises "AO2", echo it back.
         if let Some(proto_hdr) = req.headers().get("sec-websocket-protocol") {
             if let Ok(p) = proto_hdr.to_str() {

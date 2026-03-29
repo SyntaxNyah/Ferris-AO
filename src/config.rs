@@ -16,6 +16,10 @@ pub struct Config {
     pub censor: CensorConfig,
     #[serde(default)]
     pub cluster: GossipConfig,
+    #[serde(default)]
+    pub radio: RadioConfig,
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +93,11 @@ pub struct ServerConfig {
     /// Clients opt-in by sending `BINARY#1#%` as their first message.
     #[serde(default)]
     pub binary_protocol: bool,
+
+    /// When true, sets RUST_BACKTRACE=full and installs a custom panic hook
+    /// that logs the full backtrace before exiting.  Default: false.
+    #[serde(default)]
+    pub panic_backtrace: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,6 +130,18 @@ pub struct NetworkConfig {
     /// TODO: Enable when tungstenite exposes permessage-deflate in WebSocketConfig.
     #[serde(default)]
     pub ws_compression: bool,
+
+    /// Path to a PEM certificate file for native TLS on the WebSocket listener.
+    /// When both tls_cert_path and tls_key_path are set, the WS port accepts
+    /// TLS connections directly (wss://) without a reverse proxy.
+    /// Default: "" (disabled).
+    #[serde(default)]
+    pub tls_cert_path: String,
+
+    /// Path to a PEM private key file for native TLS on the WebSocket listener.
+    /// Default: "" (disabled).
+    #[serde(default)]
+    pub tls_key_path: String,
 }
 
 fn default_http_port() -> u16 { 80 }
@@ -302,6 +323,63 @@ impl Default for GossipConfig {
             gossip_port: default_gossip_port(),
             hash_replicas: default_hash_replicas(),
         }
+    }
+}
+
+/// Radio station definition.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RadioStation {
+    pub name: String,
+    pub url: String,
+    /// Optional genre label shown in /radio list.
+    #[serde(default)]
+    pub genre: String,
+}
+
+/// Radio station configuration.  Add `[radio]` and `[[radio.stations]]` to
+/// config.toml to define stations.  When `enabled = false` (the default), the
+/// /radio command is disabled entirely.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RadioConfig {
+    /// Enable /radio command.  Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// When true, any player can use /radio; when false, only DJs and area CMs.
+    /// Default: true.
+    #[serde(default = "default_radio_anyone")]
+    pub anyone_can_use: bool,
+    /// Station list.  Each entry becomes a numbered station in /radio list.
+    #[serde(default)]
+    pub stations: Vec<RadioStation>,
+}
+
+fn default_radio_anyone() -> bool { true }
+
+impl Default for RadioConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            anyone_can_use: true,
+            stations: Vec::new(),
+        }
+    }
+}
+
+/// Security-related configuration.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SecurityConfig {
+    /// Server-side pepper mixed into password hashes via HMAC-SHA256.
+    /// Env var `NYAHAO_PEPPER` takes priority over this field.
+    /// If empty/unset, no pepper is applied (backward compatible with existing hashes).
+    /// WARNING: Changing the pepper after accounts have been created invalidates
+    /// all existing passwords.  Rotate carefully.
+    #[serde(default)]
+    pub password_pepper: String,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self { password_pepper: String::new() }
     }
 }
 

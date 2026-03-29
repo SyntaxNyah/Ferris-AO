@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 use base64::Engine as _;
-use tokio::sync::mpsc::{self, Sender};
+use tokio::sync::mpsc::Sender;
 
 use crate::ratelimit::TokenBucket;
 
@@ -61,6 +61,9 @@ pub struct ClientSession {
     pub authenticated: bool,
     pub permissions: u64,
     pub mod_name: Option<String>,
+    /// Pending TOTP authentication: username + permissions to grant after the
+    /// user supplies a valid TOTP code via /totp.  Cleared on success or failure.
+    pub pending_auth: Option<(String, u64)>,
 
     // Game state
     pub area_idx: usize,
@@ -122,6 +125,7 @@ impl ClientSession {
             authenticated: false,
             permissions: 0,
             mod_name: None,
+            pending_auth: None,
             area_idx: 0,
             char_id: None,
             ooc_name: String::new(),
