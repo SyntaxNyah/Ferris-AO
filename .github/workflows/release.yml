@@ -18,12 +18,12 @@ jobs:
           - os: ubuntu-latest
             name: Linux x86_64
             target: x86_64-unknown-linux-gnu
-            artifact: nyahao-linux-x86_64
+            artifact: nyahao-abyssinian-linux-x86_64
 
           - os: windows-latest
             name: Windows x86_64
             target: x86_64-pc-windows-msvc
-            artifact: nyahao-windows-x86_64.exe
+            artifact: nyahao-abyssinian-windows-x86_64.exe
 
     steps:
       - uses: actions/checkout@v4
@@ -47,34 +47,82 @@ jobs:
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
+          name: "Abyssinian"
           files: ${{ matrix.artifact }}
           body: |
-            ## Ferris-AO ${{ github.ref_name }}
+            ## Ferris-AO — Abyssinian ${{ github.ref_name }}
 
             A privacy-first AO2 server supporting both **AO2 desktop clients** and **[WebAO](https://github.com/AttorneyOnlineVidya/webAO)** browser clients simultaneously.
 
-            ### Features
-            - Full WebAO support — browser and desktop clients share areas and see each other's IC messages in real time
+            > **Just drop the binary and run** — Ferris-AO writes all required files (`config.toml`, `data/`) on first launch. No manual setup needed to get started.
+
+            ---
+
+            ### What's new since Crab
+
+            | Feature | Crab | Abyssinian |
+            |---------|------|------------|
+            | DJ role + `/play` URL streaming | — | ✅ DJs can play in any area without CM |
+            | `/roll [NdM]` and `/flip` | — | ✅ |
+            | Backpressure (bounded outbound queue) | — | ✅ Slow clients shed gracefully |
+            | Per-client outbound queue size config | — | ✅ `outbound_queue_cap` |
+            | Delta ARUP suppression | — | ✅ Skips unchanged area broadcasts |
+            | Per-restart DB key rotation (session forward secrecy) | — | ✅ |
+            | DB write serialisation guard (connection pooling) | — | ✅ |
+            | Startup DB integrity check (WAL verification) | — | ✅ |
+            | Minimal logging mode (`"minimal"` log level) | — | ✅ |
+            | Argon2id parameter tuning | — | ✅ `argon2_memory_kib`, `_iterations`, `_parallelism` |
+            | Binary protocol (MessagePack over WebSocket) | — | ✅ opt-in via `BINARY#1#%` |
+            | Packet batching (burst coalescing) | — | ✅ |
+            | SIGHUP zero-downtime game data reload (Linux) | — | ✅ |
+            | SIGUSR1 graceful restart with countdown (Linux) | — | ✅ |
+            | `/rotatekey` — generate new DB encryption key | — | ✅ |
+            | `/rotatesecret` — rotate HMAC server secret | — | ✅ |
+            | Cluster gossip + consistent hash ring (scaffolding) | — | ✅ |
+            | First-run bootstrap (writes all files on first launch) | — | ✅ |
+            | WebSocket write-buffer tuning | — | ✅ |
+
+            ---
+
+            ### Core features (both releases)
+
+            - Full AO2 protocol — IC messages, music, evidence, pairing, HP, rebuttals, case alerts
+            - Full WebAO interoperability — browser and desktop clients share areas in real time
             - Dual TCP + WebSocket transport
-            - Full AO2 protocol (IC, music, evidence, pairing, health points, rebuttals, case alerts)
-            - Privacy-by-design — IPs and HDIDs are hashed immediately and never stored
+            - Privacy-by-design — IPs and HDIDs hashed immediately, never stored
             - AES-256-GCM encrypted database, Argon2id passwords
             - Role-based moderation (kick, ban, mute, shadowmute, watchlist)
             - PROXY Protocol v2 + Cloudflare / nginx reverse proxy support
+            - Word censor, rate limiting, per-area evidence modes
+
+            ---
 
             ### Downloads
+
             | File | Platform |
             |------|----------|
-            | `nyahao-linux-x86_64` | Linux x86_64 |
-            | `nyahao-windows-x86_64.exe` | Windows x86_64 |
+            | `nyahao-abyssinian-linux-x86_64` | Linux x86_64 |
+            | `nyahao-abyssinian-windows-x86_64.exe` | Windows x86_64 |
+
+            ---
 
             ### Quick start
-            ```bash
-            # Linux
-            chmod +x nyahao-linux-x86_64
-            ./nyahao-linux-x86_64
 
-            # Windows
-            nyahao-windows-x86_64.exe
+            **Linux:**
+            ```bash
+            chmod +x nyahao-abyssinian-linux-x86_64
+            ./nyahao-abyssinian-linux-x86_64
+            # First run creates config.toml and data/ — edit config.toml then run again
+            export NYAHAO_DB_KEY="$(openssl rand -hex 32)"
+            ./nyahao-abyssinian-linux-x86_64
             ```
-            See the [README](https://github.com/${{ github.repository }}/blob/main/README.md) for full setup instructions.
+
+            **Windows:**
+            ```
+            nyahao-abyssinian-windows-x86_64.exe
+            # First run creates config.toml and data\ — edit config.toml then run again
+            set NYAHAO_DB_KEY=<your 64-char hex key>
+            nyahao-abyssinian-windows-x86_64.exe
+            ```
+
+            See the [README](https://github.com/${{ github.repository }}/blob/main/README.md) for full setup, nginx/Cloudflare guide, and command reference.

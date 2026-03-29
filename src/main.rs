@@ -1,6 +1,15 @@
 mod auth;
 mod client;
 mod cluster;
+
+// ── Default file contents embedded at compile time ────────────────────────────
+// Used by bootstrap_if_needed() to create a ready-to-launch layout on first run.
+const DEFAULT_CONFIG: &str       = include_str!("../config.toml");
+const DEFAULT_AREAS: &str        = include_str!("../data/areas.toml");
+const DEFAULT_CHARACTERS: &str   = include_str!("../data/characters.txt");
+const DEFAULT_BACKGROUNDS: &str  = include_str!("../data/backgrounds.txt");
+const DEFAULT_MUSIC: &str        = include_str!("../data/music.txt");
+const DEFAULT_CENSOR: &str       = include_str!("../data/censor.txt");
 mod commands;
 mod config;
 mod game;
@@ -34,6 +43,9 @@ use crate::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // ── First-run bootstrap ────────────────────────────────────────────────────
+    bootstrap_if_needed();
+
     // ── Load config ────────────────────────────────────────────────────────────
     let config_path = Path::new("config.toml");
     let config = Config::load(config_path).context("Failed to load config.toml")?;
@@ -313,6 +325,63 @@ async fn main() -> Result<()> {
 
     info!("NyahAO stopped.");
     Ok(())
+}
+
+/// Write default config and data files when none are present (first run).
+///
+/// All default file contents are embedded in the binary at compile time via
+/// `include_str!`, so the binary is fully self-contained: place it anywhere,
+/// run it once, and the entire server layout is created in the current directory.
+///
+/// Only missing files are written — existing files are never overwritten.
+fn bootstrap_if_needed() {
+    let first_run = !Path::new("config.toml").exists();
+
+    if first_run {
+        match std::fs::write("config.toml", DEFAULT_CONFIG) {
+            Ok(_)  => {}
+            Err(e) => eprintln!("Warning: could not write config.toml: {}", e),
+        }
+    }
+
+    std::fs::create_dir_all("data").ok();
+
+    let data_files: &[(&str, &str)] = &[
+        ("data/areas.toml",      DEFAULT_AREAS),
+        ("data/characters.txt",  DEFAULT_CHARACTERS),
+        ("data/backgrounds.txt", DEFAULT_BACKGROUNDS),
+        ("data/music.txt",       DEFAULT_MUSIC),
+        ("data/censor.txt",      DEFAULT_CENSOR),
+    ];
+
+    for (path, content) in data_files {
+        if !Path::new(path).exists() {
+            if let Err(e) = std::fs::write(path, content) {
+                eprintln!("Warning: could not write {}: {}", path, e);
+            }
+        }
+    }
+
+    if first_run {
+        println!("╔══════════════════════════════════════════════════════════════╗");
+        println!("║            Ferris-AO  —  First Run Setup                    ║");
+        println!("╠══════════════════════════════════════════════════════════════╣");
+        println!("║  Default files have been created in the current directory:  ║");
+        println!("║    config.toml          — server name, ports, options        ║");
+        println!("║    data/areas.toml      — area definitions                  ║");
+        println!("║    data/characters.txt  — AO2 character roster              ║");
+        println!("║    data/backgrounds.txt — allowed backgrounds               ║");
+        println!("║    data/music.txt       — music list                        ║");
+        println!("║    data/censor.txt      — word censor list (disabled)       ║");
+        println!("╠══════════════════════════════════════════════════════════════╣");
+        println!("║  Next steps:                                                 ║");
+        println!("║  1. Edit config.toml — set your server name at minimum      ║");
+        println!("║  2. Set a secure DB key (required for production):           ║");
+        println!("║       export NYAHAO_DB_KEY=\"$(openssl rand -hex 32)\"         ║");
+        println!("║  3. Run the server again:  ./nyahao                         ║");
+        println!("╚══════════════════════════════════════════════════════════════╝");
+        println!();
+    }
 }
 
 /// Load the server secret from the DB, or generate and persist a new one.

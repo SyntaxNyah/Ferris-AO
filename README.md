@@ -45,23 +45,56 @@ Ferris-AO is a server backend for the AO2 protocol. It manages areas (rooms), ch
 
 ## Features
 
+### Zero-config first launch
+Drop the binary and run it — Ferris-AO writes `config.toml` and the entire `data/` layout on first run. All defaults are embedded in the binary. Edit `config.toml`, set `NYAHAO_DB_KEY`, and run again.
+
+### Core
 - **Dual transport** — Accepts both legacy TCP (AO2 desktop) and WebSocket (WebAO browser client) connections simultaneously
-- **WebAO support** — Full interoperability with [WebAO](https://github.com/AttorneyOnline/webAO: browser and desktop clients share areas, see each other's IC messages, and interact in real time
-- **Full AO2 protocol** — Supports all standard packets including IC messages, music changes, evidence, health points, rebuttals, case alerts, and pairing
+- **WebAO support** — Full interoperability with [WebAO](https://github.com/AttorneyOnlineVidya/webAO); browser and desktop clients share areas, see each other's IC messages, and interact in real time
+- **Full AO2 protocol** — IC messages, music changes, evidence, health points, rebuttals, case alerts, and pairing
 - **Privacy-by-design** — IPs hashed to daily-rotating IPIDs; HDIDs permanently hashed; nothing sensitive is ever logged
-- **Encrypted database** — All ban and account records are stored with AES-256-GCM encryption via an embedded [redb](https://github.com/cberner/redb) database
-- **Argon2id passwords** — Moderator accounts use state-of-the-art password hashing
-- **Role-based permissions** — Fine-grained permission bitmask (admin, mod, trial, CM roles)
+- **Encrypted database** — All ban and account records encrypted with AES-256-GCM at rest via [redb](https://github.com/cberner/redb)
+- **Per-restart forward secrecy** — DB encryption key is re-derived on every startup via HMAC-SHA256; a memory dump from one session cannot decrypt the next
+- **Startup DB integrity check** — Verifies all tables are readable after WAL replay before accepting connections
+- **Argon2id passwords** — Configurable memory/iteration/parallelism parameters for future-proof account hashing
+- **Role-based permissions** — Fine-grained permission bitmask (admin, mod, trial, CM, DJ roles)
 - **Area system** — Multiple configurable areas with per-area evidence modes, backgrounds, locks, CMs, and HP tracking
+
+### Moderation
 - **Moderation suite** — Kick, ban (temporary or permanent), mute (IC/OOC/music/judge/shadow variants), warn, announce, private messaging, watchlist
 - **Watchlist** — Flag player HDIDs with notes; all authenticated mods are alerted when a watched player connects
-- **Pairing system** — `cccc_ic_support` pairing: players can request to appear side-by-side in IC messages
-- **Private messaging** — `/pm` and `/r` commands for direct player-to-player messages
-- **WebSocket keepalive** — Configurable Ping/Pong intervals to detect and drop stale connections
-- **PROXY Protocol v2** — Recovers real client IPs when running behind nginx (required for accurate IPIDs behind a proxy)
-- **Cloudflare-ready** — WebSocket proxy handles `CF-Connecting-IP` and `X-Real-IP` headers (trusted only from loopback)
-- **Word censor** — Optional `data/censor.txt` word list; IC messages containing a censored word are silently intercepted (shown to the sender as sent, not broadcast to others)
-- **Packet size enforcement** — Configurable hard limit on incoming packet bytes; oversized packets are dropped before parsing
+- **Shadow mute** — Victim's messages appear sent to them but nobody else sees them
+
+### Gameplay
+- **Pairing system** — `cccc_ic_support` pairing: players appear side-by-side in IC messages
+- **Private messaging** — `/pm` and `/r` commands
+- **Narrator mode** — Speak without a character sprite
+- **DJ role** — Players with the DJ permission can use `/play` and stream audio URLs in any area without CM status
+- **Dice and coins** — `/roll [NdM]` (up to 20 dice, 2–10000 sides) and `/flip` broadcast to the area
+
+### Performance & Reliability
+- **Backpressure** — Each client has a bounded outbound channel; persistently slow clients are shed gracefully without blocking others
+- **Packet batching** — Burst messages are coalesced into a single write per flush cycle
+- **Delta ARUP** — Area update broadcasts are skipped when area state hasn't changed since the last send
+- **Binary protocol** — Optional MessagePack encoding over WebSocket for reduced bandwidth (opt-in via `BINARY#1#%`)
+- **DB write serialisation** — Explicit write guard prevents contention across concurrent `spawn_blocking` callers
+- **Graceful restart (SIGUSR1)** — Broadcasts a 10-second countdown to all clients before exit (Linux only)
+- **Zero-downtime reload (SIGHUP)** — Hot-reloads characters, music, backgrounds, and censor words without restarting (Linux only)
+
+### Security
+- **Secret rotation** — `/rotatesecret` generates a new HMAC key; applied on next restart with `secret_rotation_enabled = true`
+- **DB key rotation** — `/rotatekey` generates a new AES-256 key file; activated on next restart with `key_rotation_enabled = true`
+- **Minimal logging mode** — Set `log_level = "minimal"` to suppress everything below warnings
+
+### Networking
+- **WebSocket keepalive** — Configurable Ping/Pong intervals to detect stale connections
+- **PROXY Protocol v2** — Recovers real client IPs behind nginx
+- **Cloudflare-ready** — Handles `CF-Connecting-IP`, `X-Forwarded-For`, `X-Real-IP`
+- **Cluster gossip** — Optional UDP gossip heartbeat with consistent-hash ring for multi-node routing (requires shared backend — see `cluster.enabled` in config)
+
+### Developer
+- **Word censor** — Hot-reloadable `data/censor.txt`; matched messages silently intercepted sender-side
+- **Packet size enforcement** — Hard limit on incoming bytes; oversized packets dropped before parsing
 - **Aggressive release optimization** — LTO + single codegen unit for minimal binary size and maximum throughput
 
 ---
@@ -263,6 +296,14 @@ Ferris-AO is configured via `config.toml` in the working directory.
 | `asset_url` | string | `""` | URL to an asset bundle for clients to download (leave empty to disable) |
 | `multiclient_limit` | integer | `8` | Maximum simultaneous connections sharing the same IPID |
 | `max_packet_bytes` | integer | `8192` | Hard limit on incoming packet size in bytes. Packets larger than this are dropped before parsing. |
+| `outbound_queue_cap` | integer | `256` | Maximum packets queued in each client's outbound channel. Excess packets are silently dropped. Increase for high-traffic areas; decrease to shed slow consumers sooner. |
+| `secret_rotation_enabled` | boolean | `false` | When `true`, applies a pending HMAC secret on startup (generated by `/rotatesecret`). Existing HDID-keyed records will no longer match after rotation — review bans/watchlist first. |
+| `key_rotation_enabled` | boolean | `false` | When `true`, loads a new AES key from `data/db_key_new.hex` on startup and renames it to `db_key_active.hex`. **Starts a fresh database — back up first.** |
+| `argon2_memory_kib` | integer | `65536` | Argon2id memory cost in KiB (64 MiB default). Increase for stronger password hashing. |
+| `argon2_iterations` | integer | `3` | Argon2id iteration count (time cost). |
+| `argon2_parallelism` | integer | `2` | Argon2id parallelism (thread count). |
+| `binary_protocol` | boolean | `false` | Allow clients to negotiate MessagePack binary encoding via `BINARY#1#%`. Reduces bandwidth for WebSocket clients. |
+| `packet_batch_size` | integer | `0` | Reserved for timer-based packet batching. `0` = disabled (current burst-drain batching always active). |
 
 ### `[network]`
 
@@ -276,6 +317,7 @@ Ferris-AO is configured via `config.toml` in the working directory.
 | `reverse_proxy_https_port` | integer | `443` | External HTTPS/WSS port advertised to the master server when `reverse_proxy_mode = true` |
 | `ws_ping_interval_secs` | integer | `30` | Seconds between WebSocket Ping frames for keepalive. Set to `0` to disable. |
 | `ws_ping_timeout_secs` | integer | `90` | Seconds to wait for a Pong response before treating the connection as stale and closing it. Set to `0` to disable. |
+| `ws_compression` | boolean | `false` | Reserved for WebSocket permessage-deflate support (requires future tungstenite upgrade). |
 
 ### `[privacy]`
 
@@ -305,8 +347,20 @@ The server posts immediately on startup, every 5 minutes, and whenever the playe
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `log_level` | string | `"info"` | Tracing log level: `trace`, `debug`, `info`, `warn`, `error` |
+| `log_level` | string | `"info"` | Tracing log level: `trace`, `debug`, `info`, `warn`, `error`, or `"minimal"` (alias for `warn` — warnings and errors only) |
 | `log_chat` | boolean | `false` | Whether to log IC message content. Disabled by default for privacy. |
+
+### `[cluster]`
+
+Optional. Enables UDP gossip heartbeat for multi-node deployments. All fields default to disabled.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Enable the gossip protocol |
+| `node_id` | string | `""` | Unique identifier for this node. Auto-generated from hostname + port if empty. |
+| `peers` | array | `[]` | Peer addresses to gossip with (`"host:port"` strings) |
+| `gossip_port` | integer | `27019` | UDP port for incoming gossip messages |
+| `hash_replicas` | integer | `150` | Virtual nodes per physical node in the consistent-hash ring |
 
 **Example `config.toml` — direct (no proxy):**
 
@@ -542,6 +596,24 @@ While the server is running, the process reads commands from stdin:
 | `setrole <username> <role>` | Change an existing account's role (`admin`, `mod`, `trial`, `cm`, `none`) |
 | `shutdown` | Gracefully shut down the server |
 | `help` | List available CLI commands |
+
+---
+
+### Signals (Linux only)
+
+| Signal | Effect |
+|--------|--------|
+| `SIGHUP` | Hot-reload characters, music, backgrounds, and censor words — no restart needed |
+| `SIGUSR1` | Graceful restart — broadcasts a 10-second countdown to all connected clients, then exits. Your process manager (systemd, etc.) handles the restart. |
+| `SIGINT` / `Ctrl-C` | Immediate shutdown |
+
+```bash
+# Hot-reload data files after editing characters.txt / music.txt / etc.
+kill -HUP $(pidof nyahao)
+
+# Graceful restart (10-second player warning before exit)
+kill -USR1 $(pidof nyahao)
+```
 
 ---
 
@@ -1087,7 +1159,9 @@ Commands are entered in the OOC chat box prefixed with `/`.
 | `/status <status>` | Set the area status: `idle`, `rp`, `casing`, `looking-for-players`, `recess`, `gaming` |
 | `/lock [-s]` | Lock the area to new players. `-s` makes it spectatable (can watch, not speak) |
 | `/unlock` | Unlock the area, allowing anyone to join |
-| `/play <song>` | Change the area music (if not locked) |
+| `/play <song or URL>` | Change the area music, or stream an `http(s)://` URL. Requires CM in the area, `PERM_CM`, or `PERM_DJ`. |
+| `/roll [NdM]` | Roll dice and broadcast the result. Default: `1d6`. Max 20 dice, 2–10000 sides. Example: `/roll 2d20` |
+| `/flip` | Flip a coin (Heads/Tails) and broadcast the result. |
 | `/login <user> <pass>` | Authenticate as a moderator account |
 | `/logout` | Log out of your moderator account |
 | `/pair <uid>` | Request to pair with another player (side-by-side IC messages) |
@@ -1119,8 +1193,10 @@ These commands require specific permissions (see [Permission System](#permission
 | `/watchlist add <hdid> [note]` | `WATCHLIST` | Add a hashed HDID to the watchlist with an optional note. |
 | `/watchlist remove <hdid>` | `WATCHLIST` | Remove a hashed HDID from the watchlist. |
 | `/watchlist list` | `WATCHLIST` | List all watchlist entries with who added them and when. |
-| `/reload` | `ADMIN` | Hot-reload characters, music, and backgrounds without restarting. |
+| `/reload` | `ADMIN` | Hot-reload characters, music, backgrounds, and censor words without restarting. |
 | `/logoutall` | `ADMIN` | Force-logout all authenticated moderator sessions. |
+| `/rotatekey` | `ADMIN` | Generate a new AES-256 DB key to `data/db_key_new.hex`. Set `key_rotation_enabled = true` and restart to apply. |
+| `/rotatesecret` | `ADMIN` | Generate a new HMAC server secret. Set `secret_rotation_enabled = true` and restart to apply. Existing HDID-keyed records will no longer match after rotation. |
 
 ---
 
@@ -1143,6 +1219,7 @@ Permissions are stored as a 64-bit bitmask on each account. Multiple permissions
 | `MUTE` | `1024` | Can mute/unmute players |
 | `LOG` | `2048` | Can access server logs |
 | `WATCHLIST` | `4096` | Can add/remove/list watchlist entries |
+| `DJ` | `8192` | Can use `/play` and stream audio URLs in any area regardless of CM status |
 | `ADMIN` | `ALL` | All permissions |
 
 ### Roles
@@ -1155,6 +1232,7 @@ When creating accounts via `mkusr`, specify one of these role names:
 | `mod` / `moderator` | `KICK`, `BAN`, `BYPASS_LOCK`, `MOD_EVI`, `MODIFY_AREA`, `MOVE_USERS`, `MOD_SPEAK`, `BAN_INFO`, `MOD_CHAT`, `MUTE`, `LOG`, `WATCHLIST` |
 | `trial` | `KICK`, `MOD_CHAT`, `MUTE` |
 | `cm` | `CM`, `BYPASS_LOCK`, `MOD_EVI` |
+| `dj` | `DJ` |
 
 ---
 
@@ -1280,6 +1358,7 @@ Ferris-AO/
     ├── commands/
     │   ├── mod.rs
     │   └── registry.rs     # All /command implementations
+    ├── cluster.rs           # Gossip protocol, consistent-hash ring, cluster scaffolding
     ├── ratelimit.rs         # TokenBucket implementation
     └── ms.rs               # Master server advertisement
 ```
