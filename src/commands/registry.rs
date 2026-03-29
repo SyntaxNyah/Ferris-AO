@@ -95,7 +95,7 @@ Commands:
 }
 
 fn cmd_about(session: &mut ClientSession, state: &Arc<ServerState>) {
-    session.server_message(&state.config.server.name, &format!("NyahAO v0.1.0 - Privacy-first AO2 server"));
+    session.server_message(&state.config.server.name, &format!("{} - Privacy-first AO2 server", crate::server::VERSION));
 }
 
 async fn cmd_who(session: &mut ClientSession, state: &Arc<ServerState>) {

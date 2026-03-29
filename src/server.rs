@@ -21,7 +21,7 @@ use crate::{
     storage::EncryptedDb,
 };
 
-pub const VERSION: &str = "NyahAO v0.1.0";
+pub const VERSION: &str = concat!("NyahAO v", env!("CARGO_PKG_VERSION"), " (Abyssinian)");
 
 /// Cached snapshot of the last-broadcast ARUP values.
 ///
