@@ -95,7 +95,7 @@ Commands:
 }
 
 fn cmd_about(session: &mut ClientSession, state: &Arc<ServerState>) {
-    session.server_message(&state.config.server.name, &format!("{} - Privacy-first AO2 server", crate::server::VERSION));
+    session.server_message(&state.config.server.name, &format!("{} - Privacy-first AO2 server | https://github.com/SyntaxNyah/Ferris-AO", crate::server::VERSION));
 }
 
 async fn cmd_who(session: &mut ClientSession, state: &Arc<ServerState>) {
