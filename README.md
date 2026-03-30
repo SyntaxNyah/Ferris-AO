@@ -1200,7 +1200,8 @@ Commands are entered in the OOC chat box prefixed with `/`.
 | `/play <song or URL>` | Change the area music, or stream an `http(s)://` URL. Requires CM in the area, `PERM_CM`, or `PERM_DJ`. |
 | `/roll [NdM]` | Roll dice and broadcast the result. Default: `1d6`. Max 20 dice, 2–10000 sides. Example: `/roll 2d20` |
 | `/flip` | Flip a coin (Heads/Tails) and broadcast the result. |
-| `/login <user> <pass>` | Authenticate as a moderator account |
+| `/login <user> <pass>` | Authenticate as a moderator account. If 2FA is enabled, you will be prompted to complete login with `/totp`. |
+| `/totp <code>` | Complete a pending two-factor login after `/login` when TOTP 2FA is enabled on your account. |
 | `/logout` | Log out of your moderator account |
 | `/pair <uid>` | Request to pair with another player (side-by-side IC messages) |
 | `/unpair` | Cancel your current pairing |
