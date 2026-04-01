@@ -1,0 +1,82 @@
+Ferris-AO Non-Commercial Attribution License
+Version 1.0 — 2026
+
+Copyright (c) 2026 SyntaxNyah
+All original work in this repository is authored by SyntaxNyah.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TERMS AND CONDITIONS
+
+1. GRANT OF RIGHTS
+
+   Permission is hereby granted, free of charge, to any person obtaining a
+   copy of this software and associated documentation files (the "Software"),
+   to use, copy, modify, merge, distribute, and sublicense the Software,
+   subject to the conditions set out in this license.
+
+2. ATTRIBUTION (REQUIRED)
+
+   Any use, distribution, modification, or derivative work of this Software —
+   in any form, public or private — must include clear, visible credit to the
+   original author:
+
+       Original author: SyntaxNyah
+       Project: Ferris-AO
+       Source: https://github.com/SyntaxNyah/Ferris-AO
+
+   This credit must appear in:
+   - The source code (e.g. in a comment block, README, or CREDITS file), AND
+   - Any public-facing interface, documentation, or release notes where the
+     Software or a derivative of it is presented.
+
+   The credit must not be hidden, obscured, or misrepresent the original
+   authorship. You may not claim that you wrote the original Software.
+
+3. NON-COMMERCIAL USE ONLY
+
+   You may NOT use this Software, or any derivative work based on it, for
+   commercial purposes. This includes but is not limited to:
+
+   - Selling the Software or charging for access to it
+   - Incorporating it into a product or service for which payment is received
+   - Using it to generate advertising revenue
+   - Offering it as a paid or freemium hosted service
+
+   "Commercial purposes" means any activity primarily intended for commercial
+   advantage or monetary compensation.
+
+4. OPEN SOURCE / NO GATEKEEPING
+
+   If you distribute a modified version of this Software, you must make the
+   full source code of your modifications publicly available under the same
+   terms as this license. You may not distribute only compiled binaries without
+   also providing the source code.
+
+   You may not impose additional restrictions on recipients' exercise of the
+   rights granted by this license.
+
+5. NO WARRANTY
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHOR OR COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+   FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+   IN THE SOFTWARE.
+
+6. TERMINATION
+
+   Your rights under this license terminate automatically if you fail to comply
+   with any of its terms. Upon termination you must cease all use and
+   distribution of the Software.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TL;DR (not legally binding, just a human-readable summary):
+
+  ✔  Fork it, use it, modify it, share it — go wild.
+  ✔  Keep the code open. Don't lock it behind a closed repo.
+  ✔  Credit SyntaxNyah. Always. Visibly.
+  ✘  Don't make money from it.
