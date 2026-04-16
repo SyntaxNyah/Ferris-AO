@@ -66,9 +66,12 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    // ── Panic hook (when panic_backtrace = true) ────────────────────────────────
-    // Read panic_backtrace from a temporary partial config load. We handle it
-    // here before the full state is built so panics in startup are also caught.
+    // ── Panic hook ────────────────────────────────────────────────────────────
+    // Always install a logging panic hook so stray panics in per-connection
+    // worker tasks are recorded (via tracing::error) but don't bring down the
+    // runtime.  When `panic_backtrace = true`, switch to the loud mode that
+    // prints a full backtrace and terminates the process (useful for CI and
+    // development).
     if config.server.panic_backtrace {
         std::env::set_var("RUST_BACKTRACE", "full");
         std::panic::set_hook(Box::new(|info| {
@@ -78,6 +81,27 @@ async fn main() -> Result<()> {
             std::process::exit(1);
         }));
         info!("Panic backtrace enabled (RUST_BACKTRACE=full).");
+    } else {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // Log and keep going — the tokio runtime only unwinds the
+            // offending task, which is the safe outcome we want in
+            // production.  Surface the payload location for diagnosis.
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_else(|| "unknown".to_string());
+            let payload: &str = if let Some(s) = info.payload().downcast_ref::<&str>() {
+                s
+            } else if let Some(s) = info.payload().downcast_ref::<String>() {
+                s.as_str()
+            } else {
+                "(non-string panic payload)"
+            };
+            tracing::error!(location = %location, payload = %payload, "task panic caught; continuing");
+            // Preserve any user-installed hook behaviour.
+            default_hook(info);
+        }));
     }
 
     info!("Starting NyahAO server…");

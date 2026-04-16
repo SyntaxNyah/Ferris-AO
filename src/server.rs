@@ -3,9 +3,9 @@ use std::cmp::Reverse;
 use std::net::IpAddr;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex as StdMutex,
 };
-use tokio::sync::{mpsc::Sender, watch, Mutex, RwLock};
+use tokio::sync::{mpsc::Sender, watch, Mutex, RwLock, Semaphore};
 use std::collections::HashMap;
 
 use std::collections::HashSet;
@@ -116,6 +116,19 @@ pub struct ServerState {
     /// Checked in the TCP and WebSocket listeners before a session is created.
     pub conn_limiters: Mutex<HashMap<IpAddr, TokenBucket>>,
 
+    /// Global semaphore limiting total concurrent connections across TCP + WS.
+    /// Each accepted connection owns one permit until it closes.
+    pub connection_sem: Arc<Semaphore>,
+
+    /// Per-source-IP current concurrent connection counter. Counter is
+    /// decremented by a drop guard in the connection task.
+    pub ip_conn_counts: StdMutex<HashMap<IpAddr, usize>>,
+
+    /// Per-source-IPID login attempt rate limiters. Protects Argon2id from
+    /// being used as a CPU-exhaustion vector.  Keyed on the hashed IPID to
+    /// avoid storing raw IPs.
+    pub login_limiters: StdMutex<HashMap<String, TokenBucket>>,
+
     /// Last-broadcast ARUP values — used for delta suppression.
     pub last_arup: Mutex<ArupSnapshot>,
 }
@@ -142,6 +155,8 @@ impl ServerState {
             pool.push(Reverse(i));
         }
 
+        let max_connections = config.server.max_connections.max(1);
+
         Self {
             config,
             reloadable: RwLock::new(reloadable),
@@ -157,6 +172,9 @@ impl ServerState {
             watchlist,
             player_watch_tx,
             conn_limiters: Mutex::new(HashMap::new()),
+            connection_sem: Arc::new(Semaphore::new(max_connections)),
+            ip_conn_counts: StdMutex::new(HashMap::new()),
+            login_limiters: StdMutex::new(HashMap::new()),
             last_arup: Mutex::new(ArupSnapshot::default()),
         }
     }
@@ -172,10 +190,68 @@ impl ServerState {
         let mut limiters = self.conn_limiters.lock().await;
         // Prune full (idle) buckets to prevent unbounded growth.
         limiters.retain(|_, bucket| !bucket.is_full());
+        // Hard cap on entries to guarantee O(1) memory under IP spoofing.
+        if limiters.len() >= 65_536 {
+            return false;
+        }
         let bucket = limiters
             .entry(ip)
             .or_insert_with(|| TokenBucket::new(rl.conn_rate, rl.conn_burst));
         bucket.try_consume()
+    }
+
+    /// Check whether a login attempt from `ipid` is within the configured rate.
+    /// Returns `true` if allowed.  Falls through (always allowed) if burst = 0.
+    pub fn check_login_rate(&self, ipid: &str) -> bool {
+        let rl = &self.config.rate_limits;
+        if rl.login_burst == 0 {
+            return true;
+        }
+        let mut limiters = match self.login_limiters.lock() {
+            Ok(g) => g,
+            Err(_) => return true, // poisoned — fail open to avoid locking out admins
+        };
+        // Prune idle buckets.
+        limiters.retain(|_, bucket| !bucket.is_full());
+        if limiters.len() >= 65_536 {
+            return false;
+        }
+        let bucket = limiters
+            .entry(ipid.to_string())
+            .or_insert_with(|| TokenBucket::new(rl.login_rate, rl.login_burst));
+        bucket.try_consume()
+    }
+
+    /// Attempt to reserve a concurrent-connection slot for `ip`.
+    /// Returns `Some(ConnSlot)` if the per-IP and global limits permit the
+    /// connection; the slot decrements counters on drop.
+    pub fn try_reserve_conn(self: &Arc<Self>, ip: IpAddr) -> Option<ConnSlot> {
+        // Try the global semaphore first (non-blocking).
+        let sem = Arc::clone(&self.connection_sem);
+        let permit = match sem.try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => return None,
+        };
+
+        // Per-IP counter.
+        let max_per_ip = self.config.server.max_conns_per_ip;
+        if max_per_ip > 0 {
+            let mut counts = match self.ip_conn_counts.lock() {
+                Ok(g) => g,
+                Err(_) => return None,
+            };
+            let entry = counts.entry(ip).or_insert(0);
+            if *entry >= max_per_ip {
+                return None; // dropping permit here is automatic
+            }
+            *entry += 1;
+        }
+
+        Some(ConnSlot {
+            state: Arc::clone(self),
+            ip,
+            _permit: permit,
+        })
     }
 
     pub fn player_count(&self) -> usize {
@@ -216,22 +292,34 @@ impl ServerState {
     }
 
     /// Send a packet to all clients with a joined UID.
+    ///
+    /// Broadcast fan-out pattern: clone the sender list under lock, release
+    /// the lock, then dispatch without holding it — prevents broadcasts from
+    /// serializing all other client-map access.
     pub async fn broadcast(&self, header: &str, args: &[&str]) {
         let msg = Self::format_packet(header, args);
-        let clients = self.clients.lock().await;
-        for handle in clients.values() {
-            handle.send(&msg);
+        let senders: Vec<Sender<String>> = {
+            let clients = self.clients.lock().await;
+            clients.values().map(|h| h.tx.clone()).collect()
+        };
+        for tx in senders {
+            let _ = tx.try_send(msg.clone());
         }
     }
 
     /// Send a packet to all clients in a specific area.
     pub async fn broadcast_to_area(&self, area_idx: usize, header: &str, args: &[&str]) {
         let msg = Self::format_packet(header, args);
-        let clients = self.clients.lock().await;
-        for handle in clients.values() {
-            if handle.area_idx == area_idx {
-                handle.send(&msg);
-            }
+        let senders: Vec<Sender<String>> = {
+            let clients = self.clients.lock().await;
+            clients
+                .values()
+                .filter(|h| h.area_idx == area_idx)
+                .map(|h| h.tx.clone())
+                .collect()
+        };
+        for tx in senders {
+            let _ = tx.try_send(msg.clone());
         }
     }
 
@@ -239,11 +327,16 @@ impl ServerState {
     /// `sender_uid` in their ignore list (used for IC and OOC messages).
     pub async fn broadcast_to_area_from(&self, area_idx: usize, sender_uid: u32, header: &str, args: &[&str]) {
         let msg = Self::format_packet(header, args);
-        let clients = self.clients.lock().await;
-        for handle in clients.values() {
-            if handle.area_idx == area_idx && !handle.ignored_uids.contains(&sender_uid) {
-                handle.send(&msg);
-            }
+        let senders: Vec<Sender<String>> = {
+            let clients = self.clients.lock().await;
+            clients
+                .values()
+                .filter(|h| h.area_idx == area_idx && !h.ignored_uids.contains(&sender_uid))
+                .map(|h| h.tx.clone())
+                .collect()
+        };
+        for tx in senders {
+            let _ = tx.try_send(msg.clone());
         }
     }
 
@@ -351,6 +444,31 @@ impl ServerState {
         args.extend(current.iter().cloned());
         let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         self.broadcast("ARUP", &refs).await;
+    }
+}
+
+/// RAII guard for a per-IP + global connection slot.
+///
+/// Held for the lifetime of a connection task.  On drop, decrements the
+/// per-IP counter (erasing the entry when it reaches 0) and releases the
+/// global semaphore permit automatically.
+pub struct ConnSlot {
+    state: Arc<ServerState>,
+    ip: IpAddr,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        if let Ok(mut counts) = self.state.ip_conn_counts.lock() {
+            if let Some(n) = counts.get_mut(&self.ip) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    counts.remove(&self.ip);
+                }
+            }
+        }
+        // Global permit releases automatically when `_permit` drops.
     }
 }
 

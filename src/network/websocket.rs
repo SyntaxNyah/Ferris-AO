@@ -42,6 +42,8 @@ pub struct WsTransport {
     pub last_pong: std::time::Instant,
     /// Hard packet size cap in bytes.
     max_packet_bytes: usize,
+    /// Maximum number of `#`-separated fields allowed per packet.
+    max_packet_fields: usize,
 }
 
 impl WsTransport {
@@ -73,7 +75,20 @@ impl WsTransport {
             if let Some(idx) = self.buf.find('%') {
                 let raw = self.buf[..idx].to_string();
                 self.buf.drain(..=idx);
-                return Some(Packet::parse(raw.as_bytes()).map_err(Into::into));
+                let max_bytes = if self.max_packet_bytes > 0 {
+                    self.max_packet_bytes
+                } else {
+                    crate::protocol::packet::MAX_PACKET_SIZE
+                };
+                let max_fields = if self.max_packet_fields > 0 {
+                    self.max_packet_fields
+                } else {
+                    crate::protocol::packet::MAX_PACKET_FIELDS
+                };
+                return Some(
+                    Packet::parse_with_limit(raw.as_bytes(), max_bytes, max_fields)
+                        .map_err(Into::into),
+                );
             }
 
             // Hard-drop if buffer exceeds the packet size cap.
@@ -160,22 +175,48 @@ async fn accept_ws(
     // These values accommodate batch-written multi-packet bursts without
     // excessive buffering.
     //
+    // Inbound message/frame ceilings are derived from `max_packet_bytes`
+    // (with a floor of 64 KiB for handshake/control traffic).  This prevents
+    // an attacker from sending a single multi-gigabyte frame that would
+    // exhaust memory before our own post-parse packet-size check runs.
+    //
     // NOTE: permessage-deflate (RFC 7692) compression is not yet available in
     // tungstenite 0.26.  The `network.ws_compression` config field is reserved
     // for future use.  When we upgrade to a version that exposes
     // WebSocketConfig::compression, enable it here with DeflateConfig::default()
     // when `state.config.network.ws_compression = true`.
     // TODO: Enable when tungstenite exposes permessage-deflate in WebSocketConfig.
+    let inbound_cap = state
+        .config
+        .server
+        .max_packet_bytes
+        .max(65_536)
+        .min(4 * 1024 * 1024); // hard ceiling of 4 MiB
     let ws_config = WebSocketConfig::default()
         .write_buffer_size(128 * 1024)
-        .max_write_buffer_size(256 * 1024);
+        .max_write_buffer_size(256 * 1024)
+        .max_message_size(Some(inbound_cap))
+        .max_frame_size(Some(inbound_cap));
 
-    // Optionally wrap in TLS before WebSocket upgrade.
+    // Disable Nagle for responsive AO2 packets.
+    let _ = stream.set_nodelay(true);
+
+    let handshake_timeout = std::time::Duration::from_secs(
+        state.config.server.handshake_timeout_secs.max(5),
+    );
+
+    // Optionally wrap in TLS before WebSocket upgrade.  Bound the TLS
+    // handshake with a timeout so a silent attacker cannot hold a worker
+    // task open indefinitely.
     let boxed_stream: Box<dyn AsyncIo> = if let Some(acceptor) = tls.as_deref() {
-        match acceptor.accept(stream).await {
-            Ok(tls_stream) => Box::new(tls_stream),
-            Err(e) => {
+        match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
+            Ok(Ok(tls_stream)) => Box::new(tls_stream),
+            Ok(Err(e)) => {
                 debug!("TLS handshake failed from {}: {}", peer, e);
+                return Ok(());
+            }
+            Err(_) => {
+                debug!("TLS handshake timeout from {}", peer);
                 return Ok(());
             }
         }
@@ -183,7 +224,7 @@ async fn accept_ws(
         Box::new(stream)
     };
 
-    let ws = accept_hdr_async_with_config(boxed_stream, move |req: &Request, mut res: Response| {
+    let ws_fut = accept_hdr_async_with_config(boxed_stream, move |req: &Request, mut res: Response| {
         // Sub-protocol acknowledgement: if the client advertises "AO2", echo it back.
         if let Some(proto_hdr) = req.headers().get("sec-websocket-protocol") {
             if let Ok(p) = proto_hdr.to_str() {
@@ -218,8 +259,20 @@ async fn accept_ws(
             }
         }
         Ok(res)
-    }, Some(ws_config))
-    .await?;
+    }, Some(ws_config));
+
+    // Hard cap on the HTTP upgrade — blocks slowloris-style hangs.
+    let ws = match tokio::time::timeout(handshake_timeout, ws_fut).await {
+        Ok(Ok(ws)) => ws,
+        Ok(Err(e)) => {
+            debug!("WS upgrade failed from {}: {}", peer, e);
+            return Ok(());
+        }
+        Err(_) => {
+            debug!("WS upgrade timeout from {}", peer);
+            return Ok(());
+        }
+    };
 
     let real_ip = extracted_ip.lock().unwrap().unwrap_or(peer.ip());
     debug!("WS client resolved IP={}", real_ip);
@@ -229,13 +282,25 @@ async fn accept_ws(
         return Ok(());
     }
 
+    // Reserve global + per-IP slot; guard holds until this task ends.
+    let _slot = match state.try_reserve_conn(real_ip) {
+        Some(slot) => slot,
+        None => {
+            debug!("WS connection denied (cap reached) for {}", real_ip);
+            return Ok(());
+        }
+    };
+
     let max_packet_bytes = state.config.server.max_packet_bytes;
+    let max_packet_fields = state.config.server.max_packet_fields;
     let transport = AoTransport::Ws(WsTransport {
         ws,
         buf: String::new(),
         last_pong: std::time::Instant::now(),
         max_packet_bytes,
+        max_packet_fields,
     });
     handle_connection(transport, real_ip, state, shutdown).await;
+    drop(_slot);
     Ok(())
 }

@@ -498,6 +498,15 @@ async fn cmd_play(session: &mut ClientSession, state: &Arc<ServerState>, args: V
         return;
     }
     let song = args.join(" ");
+    // Cap the broadcast payload: /play otherwise lets a privileged client
+    // trigger an arbitrarily large MC packet to every peer in the area.
+    if song.len() > 2048 {
+        session.server_message(
+            &state.config.server.name,
+            "Song name or URL is too long (max 2048 bytes).",
+        );
+        return;
+    }
     let char_id_str = session.char_id
         .map(|id| id.to_string())
         .unwrap_or_else(|| "-1".to_string());
@@ -520,8 +529,27 @@ async fn cmd_login(session: &mut ClientSession, state: &Arc<ServerState>, args: 
         session.server_message(&state.config.server.name, "Usage: /login <username> <password>");
         return;
     }
+
+    // Per-IPID login rate limit: cap Argon2id verifications from a single
+    // origin.  Without this, a single attacker can saturate the blocking
+    // thread pool just by repeating /login, starving real traffic.
+    if !state.check_login_rate(&session.ipid) {
+        session.server_message(
+            &state.config.server.name,
+            "Too many login attempts. Please wait a minute before trying again.",
+        );
+        return;
+    }
+
     let username = args[0].clone();
     let password = args[1..].join(" ");
+
+    // Input length sanity: Argon2id hashes scale with password length, so
+    // block degenerate inputs before dispatching to the blocking pool.
+    if username.len() > 64 || password.len() > 256 {
+        session.server_message(&state.config.server.name, "Invalid credentials.");
+        return;
+    }
 
     let accounts = state.accounts.clone();
     let user2 = username.clone();

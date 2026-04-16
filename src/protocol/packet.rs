@@ -2,6 +2,15 @@ use thiserror::Error;
 
 pub const MAX_PACKET_SIZE: usize = 30_720;
 
+/// Absolute ceiling on `#`-separated fields per packet.  Callers may impose
+/// a tighter limit via [`Packet::parse_with_limit`].  Guards against packets
+/// crafted solely to allocate huge `Vec<String>` instances.
+pub const MAX_PACKET_FIELDS: usize = 1024;
+
+/// Maximum bytes allowed per header token.  AO2 headers are short identifiers
+/// (HI, MS, CT…); anything longer is malformed and rejected outright.
+pub const MAX_HEADER_LEN: usize = 32;
+
 #[derive(Debug, Clone)]
 pub struct Packet {
     pub header: String,
@@ -14,6 +23,12 @@ pub enum PacketError {
     EmptyHeader,
     #[error("Packet too large")]
     TooLarge,
+    #[error("Header token too long")]
+    HeaderTooLong,
+    #[error("Header contains invalid characters")]
+    HeaderInvalid,
+    #[error("Packet has too many fields")]
+    TooManyFields,
 }
 
 impl Packet {
@@ -23,18 +38,49 @@ impl Packet {
 
     /// Parse from raw bytes (not including the trailing `%` delimiter).
     /// Wire format coming in: `HEADER#field1#field2#...#` (trailing # before %)
+    ///
+    /// Uses the module-wide defaults [`MAX_PACKET_SIZE`] and
+    /// [`MAX_PACKET_FIELDS`].  Call [`Packet::parse_with_limit`] to apply
+    /// tighter caller-configured bounds.
     pub fn parse(data: &[u8]) -> Result<Self, PacketError> {
-        if data.len() > MAX_PACKET_SIZE {
+        Self::parse_with_limit(data, MAX_PACKET_SIZE, MAX_PACKET_FIELDS)
+    }
+
+    /// Parse with custom size + field-count caps.
+    pub fn parse_with_limit(
+        data: &[u8],
+        max_bytes: usize,
+        max_fields: usize,
+    ) -> Result<Self, PacketError> {
+        if data.len() > max_bytes {
             return Err(PacketError::TooLarge);
         }
         let s = String::from_utf8_lossy(data);
         let s = s.trim();
-        // Split on '#'
+        // Cheap pre-check: count '#' before allocating a Vec.  Each '#'
+        // starts a new field; reject early on absurd field counts.
+        let delim_count = s.bytes().filter(|&b| b == b'#').count();
+        if delim_count.saturating_add(1) > max_fields.max(1) {
+            return Err(PacketError::TooManyFields);
+        }
         let mut parts: Vec<&str> = s.split('#').collect();
         if parts.is_empty() || parts[0].trim().is_empty() {
             return Err(PacketError::EmptyHeader);
         }
-        let header = parts[0].to_string();
+        let header_raw = parts[0];
+        if header_raw.len() > MAX_HEADER_LEN {
+            return Err(PacketError::HeaderTooLong);
+        }
+        // AO2 headers are ASCII alphanumeric + underscore only. Reject anything
+        // else — stops attempts to smuggle malformed framing, NULs, or unicode
+        // bombs through the dispatch table.
+        if !header_raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Err(PacketError::HeaderInvalid);
+        }
+        let header = header_raw.to_string();
         // Remove header
         parts.remove(0);
         // Remove trailing empty entry (from the trailing '#' before '%')
