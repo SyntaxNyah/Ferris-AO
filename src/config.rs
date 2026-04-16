@@ -98,6 +98,35 @@ pub struct ServerConfig {
     /// that logs the full backtrace before exiting.  Default: false.
     #[serde(default)]
     pub panic_backtrace: bool,
+
+    /// Maximum number of concurrent client connections across both TCP and WS.
+    /// Additional connections are rejected at the listener layer.  Default: 2000.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+
+    /// Maximum number of concurrent connections from a single source IP.
+    /// Prevents a single host from exhausting the global connection slots.
+    /// Default: 8.
+    #[serde(default = "default_max_conns_per_ip")]
+    pub max_conns_per_ip: usize,
+
+    /// Seconds a client may remain connected without sending any packet
+    /// before being disconnected.  Blocks slowloris-style hold-open attacks.
+    /// Default: 30.
+    #[serde(default = "default_handshake_timeout")]
+    pub handshake_timeout_secs: u64,
+
+    /// Seconds of TCP idle (no inbound packet) before forced disconnect.
+    /// 0 disables.  WebSocket clients are protected by the ping/pong keepalive.
+    /// Default: 600 (10 minutes).
+    #[serde(default = "default_tcp_idle_timeout")]
+    pub tcp_idle_timeout_secs: u64,
+
+    /// Maximum number of `#`-separated fields allowed in an incoming packet.
+    /// Packets exceeding this are dropped before further processing.
+    /// Default: 256.
+    #[serde(default = "default_max_packet_fields")]
+    pub max_packet_fields: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,6 +183,11 @@ fn default_argon2_memory() -> u32 { 65536 }
 fn default_argon2_iterations() -> u32 { 3 }
 fn default_argon2_parallelism() -> u32 { 2 }
 fn default_packet_batch_interval_ms() -> u64 { 5 }
+fn default_max_connections() -> usize { 2000 }
+fn default_max_conns_per_ip() -> usize { 8 }
+fn default_handshake_timeout() -> u64 { 30 }
+fn default_tcp_idle_timeout() -> u64 { 600 }
+fn default_max_packet_fields() -> usize { 256 }
 
 #[derive(Debug, Deserialize)]
 pub struct PrivacyConfig {
@@ -236,6 +270,15 @@ pub struct RateLimitsConfig {
     /// Connection burst ceiling per source IP.
     #[serde(default = "default_conn_burst")]
     pub conn_burst: u32,
+
+    /// Login attempts allowed per second per source IPID.
+    /// Guards Argon2id from being abused as a CPU-exhaustion vector.
+    /// Default: 0.05 (≈ 3/min).
+    #[serde(default = "default_login_rate")]
+    pub login_rate: f64,
+    /// Login attempt burst ceiling per source IPID.  Default: 5.
+    #[serde(default = "default_login_burst")]
+    pub login_burst: u32,
 }
 
 fn default_ic_rate() -> f64 { 3.0 }
@@ -250,6 +293,8 @@ fn default_zz_cooldown() -> u64 { 60 }
 // 1 connection per second (60/min) — permissive enough for bad WiFi reconnects
 fn default_conn_rate() -> f64 { 1.0 }
 fn default_conn_burst() -> u32 { 5 }
+fn default_login_rate() -> f64 { 0.05 }
+fn default_login_burst() -> u32 { 5 }
 
 /// Word-censor configuration. When enabled, IC messages containing any word
 /// from `data/censor.txt` are silently intercepted: the sender sees their
@@ -282,6 +327,8 @@ impl Default for RateLimitsConfig {
             zz_cooldown_secs: default_zz_cooldown(),
             conn_rate: default_conn_rate(),
             conn_burst: default_conn_burst(),
+            login_rate: default_login_rate(),
+            login_burst: default_login_burst(),
         }
     }
 }

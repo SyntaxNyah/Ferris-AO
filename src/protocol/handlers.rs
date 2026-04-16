@@ -414,6 +414,17 @@ async fn handle_ms(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
         debug!("MS drop: rate limited");
         return;
     }
+    // Per-field byte cap: blocks a single oversize field (e.g. a megabyte of
+    // repeated showname characters) from propagating through broadcast.
+    // The global max_packet_bytes already caps the total, but a fan-out
+    // copy multiplies that cost, so we also cap each field individually.
+    const MAX_FIELD_LEN: usize = 4096;
+    for f in pkt.body.iter() {
+        if f.len() > MAX_FIELD_LEN {
+            debug!("MS drop: field exceeds {} bytes", MAX_FIELD_LEN);
+            return;
+        }
+    }
     let shadowmuted = session.is_shadowmuted();
     if !session.can_speak_ic() {
         session.server_message(&state.config.server.name, "You are not allowed to speak in this area.");
@@ -978,6 +989,11 @@ async fn handle_ct(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
     if !session.rl_ct.try_consume() {
         return;
     }
+    // Hard cap on raw field size before decoding.  Guards against unicode
+    // bombs and absurd showname inputs in the OOC channel.
+    if pkt.body[0].len() > 256 || pkt.body[1].len() > 8192 {
+        return;
+    }
     let username = ao_decode(pkt.body[0].trim());
     if username.is_empty()
         || username == state.config.server.name
@@ -1036,9 +1052,18 @@ async fn handle_pe(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
         session.server_message(&state.config.server.name, "You are not allowed to alter evidence here.");
         return;
     }
+    // Per-field caps and a hard cap on the evidence list itself —
+    // evidence is replicated to every client in the area on every change,
+    // so unbounded growth is a fan-out-amplification DoS.
+    if pkt.body[0].len() > 256 || pkt.body[1].len() > 4096 || pkt.body[2].len() > 256 {
+        return;
+    }
     let evi_str = format!("{}&{}&{}", pkt.body[0], pkt.body[1], pkt.body[2]);
     let evi = {
         let mut area = state.areas[session.area_idx].write().await;
+        if area.evidence.len() >= 128 {
+            return;
+        }
         area.evidence.push(evi_str);
         area.evidence.clone()
     };
@@ -1076,6 +1101,9 @@ async fn handle_ee(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
         return;
     }
     let idx: usize = match pkt.body[0].parse() { Ok(n) => n, Err(_) => return };
+    if pkt.body[1].len() > 256 || pkt.body[2].len() > 4096 || pkt.body[3].len() > 256 {
+        return;
+    }
     let new_evi = format!("{}&{}&{}", pkt.body[1], pkt.body[2], pkt.body[3]);
     let evi = {
         let mut area = state.areas[session.area_idx].write().await;
@@ -1102,7 +1130,13 @@ async fn handle_zz(session: &mut ClientSession, state: &Arc<ServerState>, pkt: &
         }
     }
     session.last_zz = Some(std::time::Instant::now());
-    let reason = pkt.body.get(0).map(|s| s.as_str()).unwrap_or("");
+    let reason_full = pkt.body.get(0).map(|s| s.as_str()).unwrap_or("");
+    // Truncate at a safe byte boundary without breaking UTF-8.
+    let mut end = reason_full.len().min(512);
+    while end > 0 && !reason_full.is_char_boundary(end) {
+        end -= 1;
+    }
+    let reason = &reason_full[..end];
     let char_name = {
         let rdata = state.reloadable.read().await;
         session.char_id
@@ -1232,6 +1266,24 @@ pub async fn run_client(
     // Skip the first immediate tick so the ping doesn't fire at time 0.
     ping_timer.tick().await;
 
+    // Handshake deadline: if the client has not spoken before this fires,
+    // drop the connection.  Cleared once the first inbound packet arrives.
+    let handshake_deadline = tokio::time::sleep(std::time::Duration::from_secs(
+        state.config.server.handshake_timeout_secs.max(5),
+    ));
+    tokio::pin!(handshake_deadline);
+    let mut handshake_done = false;
+
+    // TCP-only idle deadline: guards against parked connections that hold
+    // resources forever.  WebSocket connections are covered by ping/pong
+    // keepalives above.
+    let idle_secs = state.config.server.tcp_idle_timeout_secs;
+    let is_tcp = matches!(transport, crate::network::AoTransport::Tcp(_));
+    let use_idle_timeout = is_tcp && idle_secs > 0;
+    let idle_duration = std::time::Duration::from_secs(if use_idle_timeout { idle_secs } else { 3600 });
+    let idle_timer = tokio::time::sleep(idle_duration);
+    tokio::pin!(idle_timer);
+
     // Packet batching configuration.
     // When packet_batch_size > 0, up to that many packets are drained from
     // the outbound channel and concatenated before a single transport.send().
@@ -1326,6 +1378,12 @@ pub async fn run_client(
                         break;
                     }
                     Some(Ok(pkt)) => {
+                        // Any inbound packet satisfies the handshake and
+                        // resets the idle deadline.
+                        handshake_done = true;
+                        if use_idle_timeout {
+                            idle_timer.as_mut().reset(tokio::time::Instant::now() + idle_duration);
+                        }
                         dispatch(&mut session, &state, pkt).await;
                     }
                 }
@@ -1341,6 +1399,18 @@ pub async fn run_client(
                     }
                 }
                 let _ = transport.keepalive_ping().await;
+            }
+
+            // Handshake deadline: if no packet arrived before the timeout, drop.
+            _ = &mut handshake_deadline, if !handshake_done => {
+                debug!("Handshake timeout for IPID={}", session.ipid);
+                break;
+            }
+
+            // TCP idle timeout (WebSocket ignores via `use_idle_timeout = false`).
+            _ = &mut idle_timer, if use_idle_timeout => {
+                debug!("TCP idle timeout for IPID={}", session.ipid);
+                break;
             }
         }
     }

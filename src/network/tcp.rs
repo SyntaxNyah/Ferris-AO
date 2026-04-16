@@ -31,6 +31,8 @@ pub struct TcpTransport {
     prefix: Vec<u8>,
     /// Hard packet size cap. Packets exceeding this are dropped before parsing.
     max_packet_bytes: usize,
+    /// Maximum number of `#`-separated fields allowed per packet.
+    max_packet_fields: usize,
 }
 
 impl TcpTransport {
@@ -39,6 +41,7 @@ impl TcpTransport {
         writer: tokio::net::tcp::OwnedWriteHalf,
         prefix: Vec<u8>,
         max_packet_bytes: usize,
+        max_packet_fields: usize,
     ) -> Self {
         Self {
             reader,
@@ -46,6 +49,7 @@ impl TcpTransport {
             buf: String::new(),
             prefix,
             max_packet_bytes,
+            max_packet_fields,
         }
     }
 
@@ -72,7 +76,20 @@ impl TcpTransport {
             if let Some(idx) = self.buf.find('%') {
                 let raw = self.buf[..idx].to_string();
                 self.buf.drain(..=idx);
-                return Some(Packet::parse(raw.as_bytes()).map_err(Into::into));
+                let max_bytes = if self.max_packet_bytes > 0 {
+                    self.max_packet_bytes
+                } else {
+                    crate::protocol::packet::MAX_PACKET_SIZE
+                };
+                let max_fields = if self.max_packet_fields > 0 {
+                    self.max_packet_fields
+                } else {
+                    crate::protocol::packet::MAX_PACKET_FIELDS
+                };
+                return Some(
+                    Packet::parse_with_limit(raw.as_bytes(), max_bytes, max_fields)
+                        .map_err(Into::into),
+                );
             }
 
             // Hard-drop if buffer exceeds the packet size cap (no '%' found yet).
@@ -139,18 +156,31 @@ async fn accept_tcp(
     state: Arc<ServerState>,
     shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
+    // Disable Nagle for low-latency AO2 packets.
+    let _ = stream.set_nodelay(true);
+
     let (read_half, write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
+    let handshake_timeout = std::time::Duration::from_secs(
+        state.config.server.handshake_timeout_secs.max(5),
+    );
+
     let (real_ip, prefix): (IpAddr, Vec<u8>) = if state.config.network.reverse_proxy_mode {
-        // Read exactly 12 bytes to detect the PP2 magic prefix.
-        // AO2 packets are always longer than 12 bytes, so this is safe.
+        // Read exactly 12 bytes to detect the PP2 magic prefix, with a
+        // hard timeout so a silent client cannot hold the task open.
         let mut peek = [0u8; 12];
-        reader.read_exact(&mut peek).await?;
+        match tokio::time::timeout(handshake_timeout, reader.read_exact(&mut peek)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => bail!("TCP PP2 preamble timeout from {}", peer),
+        }
 
         if &peek == PP2_MAGIC {
             // PP2 present: read the full PP2 header and extract source addr.
-            let ip = parse_pp2(&mut reader, &peek).await?;
+            let ip = tokio::time::timeout(handshake_timeout, parse_pp2(&mut reader, &peek))
+                .await
+                .map_err(|_| anyhow::anyhow!("PP2 header read timeout from {}", peer))??;
             (ip, vec![])
         } else {
             // Proxy mode on but no PP2 header — fall back to peer addr.
@@ -163,13 +193,30 @@ async fn accept_tcp(
 
     debug!("TCP client resolved IP={}", real_ip);
 
+    // Rate limit (new connections per second per IP).
     if !state.check_conn_rate(real_ip).await {
         debug!("TCP connection rate limit exceeded for {}", real_ip);
         return Ok(());
     }
 
-    let transport = AoTransport::Tcp(TcpTransport::new(reader, write_half, prefix, state.config.server.max_packet_bytes));
+    // Reserve a global + per-IP slot; RAII guard releases on drop.
+    let _slot = match state.try_reserve_conn(real_ip) {
+        Some(slot) => slot,
+        None => {
+            debug!("TCP connection denied (cap reached) for {}", real_ip);
+            return Ok(());
+        }
+    };
+
+    let transport = AoTransport::Tcp(TcpTransport::new(
+        reader,
+        write_half,
+        prefix,
+        state.config.server.max_packet_bytes,
+        state.config.server.max_packet_fields,
+    ));
     handle_connection(transport, real_ip, state, shutdown).await;
+    drop(_slot);
     Ok(())
 }
 
